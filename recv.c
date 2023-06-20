@@ -44,11 +44,11 @@ struct S {
 	pthread_mutex_t mtx;
 	Cfg cfg;
 	u64 t;
-	u32 idx, cnt, underrun, overrun, stopheur, clipped, lastthres, slack;
+	u32 idx, ctr, underrun, overrun, printctr, clipped, lastthres, slack;
 	f32 vols[MAX_CHANNELS];
 	PlayState ps;
 	struct sockaddr sa;
-	bool fullymade, first;
+	bool fullymade, logged;
 	Resample *rs;
 };
 
@@ -88,20 +88,13 @@ static bool play(S *s, u32 frames, void *out)
 		read = ringbuf_read(&s->rb, buf, need);
 	pthread_mutex_unlock(&s->mtx);
 	if (read < need) { 
-		if (s->stopheur < 300)
+		if (s->printctr < 300)
 			WARN("[%u]: underrun (%u)", s->idx, ++s->underrun);
-		s->stopheur += 100;
-		if (s->stopheur++ >= 100000000) {
-			s->stopheur = 0;
-			s->ps = PLAY_PAUSE;
-			WARN("[%u]: too many underruns, force paused client",
-			     s->idx);
-			return false;
-		}
+		s->printctr += 100;
 	} else if (read > need) {
 		read = need;
 	} else
-		s->stopheur = (u32)MAX((i32)s->stopheur - 1, 0);
+		s->printctr = (u32)MAX((i32)s->printctr - 1, 0);
 	memcpy(out, buf, read);
 	memset((u8*)out + read, 0, need - read);
 	return true;
@@ -393,6 +386,11 @@ static Inst *sioinst(Pcfg pcfg, enum SoundIoBackend backend, u32 devhash,
 		r = soundio_connect(g->sio);
 	else
 		r = soundio_connect_backend(g->sio, backend);
+	if (r == 0) {
+		const char *name =
+			soundio_backend_name(g->sio->current_backend);
+		INFO("selected backend: %s", name);
+	}
 	CHK(r == 0, "connect to backend");
 	soundio_flush_events(g->sio);
 	siofinddev(g, devhash, listdev);
@@ -656,28 +654,25 @@ static Inst *wasinst(Pcfg pcfg, u32 devhash, bool listdev)
 
 static void make(S *s, u32 idx, u32 slack, Cfg cfg, struct sockaddr *sa)
 {
-	INFO("[%u]: new client: id = %08X, rate = %u, bits = %u, "
-	     "channels = %u, type = %s, buffer size: %u frames (%u ms)", idx,
-	     cfg.id, cfg.rate, cfg.bytes * 8, cfg.channels,
-	     cfg.isfloat ? "f32" : "pcm", cfg.bufsz / framesz(cfg),
-	     cfg.bufsz * 1000 / cfg.rate);
 	*s = (S){
 		.rb = {0},
 		.cfg = cfg,
 		.t = 0,
 		.idx = idx,
-		.cnt = 0,
+		.ctr = 0,
 		.underrun = 0,
 		.overrun = 0,
-		.stopheur = 0,
+		.printctr = 0,
 		.clipped = 0,
 		.lastthres = 0,
 		.slack = slack,
 		.ps = PLAY_WAIT,
 		.sa = *sa,
 		.fullymade = false,
+		.logged = false,
 		.rs = NULL
 	};
+	INFO("[%u]: making new client", idx);
 	for (u32 i = 0; i < MAX_CHANNELS; ++i)
 		s->vols[i] = 1.0f;
 	CHK(pthread_mutex_init(&s->mtx, NULL) == 0, "[%u]: make mutex", idx);
@@ -874,8 +869,21 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 			.recvcmd = hdr.cmd
 		});
 	}
-	if (s->fullymade)
+	if (s->fullymade) {
+		if (!s->logged) {
+			INFO("[%u]: client created: id = %08X, rate = %u, "
+			     "bits = %u, channels = %u, type = %s, "
+			     "buffer size: %u frames (%u ms)", idx, cfg.id,
+			     cfg.rate, cfg.bytes * 8, cfg.channels,
+			     cfg.isfloat ? "f32" : "pcm",
+			     cfg.bufsz / framesz(cfg),
+			     cfg.bufsz * 1000 / cfg.rate);
+			s->logged = true;
+		}
 		inst->update(inst, s);
+	}
+	if (s->fullymade && !s->logged) {
+	}
 	pthread_mutex_lock(&s->mtx);
 	RingBuf *rb = !s->rs ? &s->rb : &s->rs->rb;
 	u32 bsz = (u32)read - HDR_SZ;
@@ -886,7 +894,7 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 		ringbuf_reset(rb);
 		goto unlock;
 	case CMD_PAUSE:
-		INFO("[%u]: pause, %p", s->idx, &s->ps);
+		INFO("[%u]: pause", s->idx);
 		s->ps = PLAY_PAUSE;
 		goto unlock;
 	case CMD_START:
@@ -944,11 +952,11 @@ unlock:
 	if (s->rs)
 		pthread_cond_signal(&s->rs->cnd);
 	u64 t = ns();
-	if (!quiet && s->t && (0 || s->cnt % 100 == 0)) {
+	if (!quiet && s->t && (0 || s->ctr % 100 == 0)) {
 		INFO("[%u]: recv (%u): %u bytes - %u us", idx,
-		     s->cnt, read, (u32)(t - s->t) / 1000);
+		     s->ctr, read, (u32)(t - s->t) / 1000);
 	}
-	++s->cnt;
+	++s->ctr;
 	s->t = t;
 }
 

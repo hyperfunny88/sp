@@ -412,9 +412,8 @@ static void makecon(void)
 	conready = true;
 }
 
-static DWORD WINAPI makedbg(LPVOID p)
+static DWORD WINAPI makedbg(void)
 {
-	(void)p;
 	makecon();
 	DEBUG("sp (send | low-latency | win)");
 	struct in_addr ia = {.S_un.S_addr = pcfg.ip};
@@ -444,7 +443,6 @@ static HRESULT HOOKCALL h_Initialize(
 	const WAVEFORMATEX *pFormat, LPCGUID AudioSessionGuid)
 {
 	bool skip = true;
-	HANDLE slow = NULL;
 	if (!c)
 		goto gskip;
 	if (StreamFlags & AUDCLNT_SHAREMODE_EXCLUSIVE)
@@ -466,8 +464,9 @@ static HRESULT HOOKCALL h_Initialize(
 	if (!s) {
 		s = &sstore;
 		make();
-		slow = CreateThread(NULL, 0, makedbg, NULL, 0, 0);
-		WaitForSingleObject(slow, INFINITE);
+#ifdef SP_DEBUG
+		makedbg();
+#endif
 		dohook = true;
 	}
 	u32 potidx = s->n;
