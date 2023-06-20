@@ -1,0 +1,6 @@
+#!/bin/sh
+flags="-Os -march=native -flto -Wall -Wextra -I . $CFLAGS"
+ldflags="-L /usr/local/lib -flto -s -lspeexdsp -lsoundio $LDFLAGS"
+
+$CC $flags $ldflags recv.c -o build/sp-recv &
+wait $(jobs -p)

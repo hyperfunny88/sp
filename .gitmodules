@@ -1,0 +1,6 @@
+[submodule "subprojects/minhook"]
+	path = subprojects/minhook
+	url = https://github.com/TsudaKageyu/minhook
+[submodule "subprojects/speexdsp"]
+	path = subprojects/speexdsp
+	url = https://github.com/hyperfunny88/speexdsp

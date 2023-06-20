@@ -1,0 +1,16 @@
+#!/bin/sh
+export CFLAGS=
+export CXXFLAGS=
+export LDFLAGS=
+export CC=x86_64-w64-mingw32-gcc
+export CXX=x86_64-w64-mingw32-g++
+(meson setup .meson-build-64 --cross-file=subprojects/x86_64-w64-mingw32.txt -Db_lto=true -Dstrip=true $@ &&
+	ninja -C .meson-build-64 &&
+	cp .meson-build-64/sp-send.exe build/ && 
+	cp .meson-build-64/libsp-send-ll.dll build/sp-send-ll-x64.dll &&
+	cp .meson-build-64/sp-recv.exe build/) || exit
+export CC=i686-w64-mingw32-gcc
+export CXX=i686-w64-mingw32-g++
+meson setup .meson-build-32 --cross-file=subprojects/i686-w64-mingw32.txt -Db_lto=true -Dstrip=true $@ &&
+	ninja -C .meson-build-32 &&
+	cp .meson-build-32/libsp-send-ll.dll build/sp-send-ll-x32.dll
