@@ -8,10 +8,11 @@ typedef struct {
 	IMMDevice *dev;
 	IAudioClient *client;
 	IAudioCaptureClient *capt;
+	char name[MAX_NAME];
 	Cfg cfg;
 	HANDLE evt;
 	Socket sfd;
-	u32 ip, evtto;
+	u32 ip, evtto, namesz;
 	u16 port;
 } S;
 
@@ -130,7 +131,8 @@ static HANDLE makepipe(void)
 typedef enum {
 	PIPESTATE_NONE,
 	PIPESTATE_CON,
-	PIPESTATE_WRITE,
+	PIPESTATE_PREP_READ,
+	PIPESTATE_PREP_WRITE,
 } PipeState;
 
 typedef struct {
@@ -143,12 +145,25 @@ typedef struct {
 static bool servepipe(S *s, Client *c, u32 idx)
 {
 	(void)idx;
+	DWORD tmp;
+	BOOL or = GetOverlappedResult(c->pipe, c->op, &tmp, TRUE);
+#	define PREP_READ_MSG "failed to read prep data from low-latency client"
 	switch (c->ps) {
 	case PIPESTATE_CON: {
-		DWORD tmp;
-		BOOL con = GetOverlappedResult(c->pipe, c->op, &tmp, TRUE);
-		if (!con) {
+		if (!or) {
 			WARN("failed to connect to low-latency client");
+			return false;
+		}
+		if (!ReadFile(c->pipe, c->buf, PIPE_BUF_SZ, NULL, c->op)) {
+			WARN(PREP_READ_MSG);
+			return false;
+		}
+		c->ps = PIPESTATE_PREP_READ;
+		break;
+	}
+	case PIPESTATE_PREP_READ: {
+		if (!or) {
+			WARN(PREP_READ_MSG);
 			return false;
 		}
 		LlInfo info = {
@@ -160,9 +175,8 @@ static bool servepipe(S *s, Client *c, u32 idx)
 			WARN("failed to send reply back to low-latency client");
 			return false;
 		}
-		c->ps = PIPESTATE_WRITE;
-		INFO("new low-latency client");
-		break;
+		c->ps = PIPESTATE_PREP_WRITE;
+		INFO("new low-latency client: %s", (char*)c->buf);
 	} }
 	return true;
 }
@@ -240,11 +254,21 @@ static void make(S *s, u32 ip, u16 port)
 {
 	*s = (S){
 		.ip = ip,
-		.port = port
+		.port = port,
+		.name = {0},
+		.namesz = 0
 	};
 	timeBeginPeriod(1);
 	makesock(s);
+	char hostname[MAX_NAME];
+	gethostname(hostname, MAX_NAME - 1);
+	int n = snprintf(s->name, MAX_NAME - 1, "%s/sp-send", hostname);
+	s->namesz = MIN((u32)n, MAX_NAME - 1);
 	CreateThread(NULL, 0, pipeproc, s, 0, NULL);
+}
+
+static void makecapture(S *s)
+{
 	HRESULT hr;
 	hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	CHKH(hr, "make com instance");
@@ -293,6 +317,8 @@ static void record(S *s)
 		if (hr != S_OK)
 			DIE("get buffer");
 		u8 buf[BUF_SZ], *b = buf + HDR_SZ;
+		memcpy(b, s->name, s->namesz + 1);
+		b += s->namesz + 1;
 		u32 sz = read * framesz(s->cfg);
 		u8 cmd = CMD_NONE;
 		if (flags & AUDCLNT_BUFFERFLAGS_SILENT || iszero(frames, sz)) {
@@ -307,7 +333,7 @@ static void record(S *s)
 			.sin_port = htons(s->port),
 			.sin_addr.s_addr = s->ip
 		};
-		u32 tosend = sz + HDR_SZ;
+		u32 tosend = sz + s->namesz + 1 + HDR_SZ;
 		int sent = sendto(s->sfd, (const char*)buf, (int)tosend, 0,
 				  (struct sockaddr*)&sin, sizeof(sin));
 		if ((u32)sent < tosend)
@@ -330,9 +356,17 @@ static void setupcon(void)
 			     ENABLE_VIRTUAL_TERMINAL_PROCESSING));
 }
 
+static void help(const char *argv)
+{
+	const char *s =
+		"options:\n\t"
+		"-m (mute, only use as connector with sp-send-ll)";
+	INFO("usage: %s <ip> <port> [options...]\n%s", argv, s);
+}
+
 #define HELP() do { \
-	INFO("usage: %s <ip> <port>", *argv); \
-	DIE(); } while (0)
+	help(*argv); \
+	ABORT(); } while (0)
 
 int main(int argc, char *argv[])
 {
@@ -340,11 +374,22 @@ int main(int argc, char *argv[])
 	INFO("sp (send | win)");
 	if (argc < 3)
 		HELP();
+	bool mute = false;
+	if (argc == 4) {
+		if (argv[3][0] == '-' && argv[3][1] == 'm')
+			mute = true;
+	}
 	char *end;
 	S s;
 	make(&s, inet_addr(argv[1]), (u16)strtol(argv[2], &end, 10));
-	while (true)
-		record(&s);
+	if (!mute) {
+		makecapture(&s);
+		while (true)
+			record(&s);
+	} else {
+		INFO("audio muted, keeping alive as connector");
+		Sleep(INFINITE);
+	}
 	INFO("ok");
 	return 0;
 }

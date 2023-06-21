@@ -11,7 +11,7 @@ project(
 		'warning_level=2'
 	]
 )
-cflags = ['-fvisibility=hidden', '-Wno-missing-braces', '-Wno-attributes']
+cflags = ['-DSP_WAS', '-fvisibility=hidden', '-Wno-missing-braces', '-Wno-attributes']
 cmake = import('cmake')
 x32 = host_machine.cpu_family() == 'x86'
 if not x32

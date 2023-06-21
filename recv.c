@@ -2,9 +2,20 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "util.h"
-#include <speex/speex_resampler.h>
-#ifndef _WIN32
-#include <soundio/soundio.h>
+#ifdef SP_SIO
+#	include <soundio/soundio.h>
+#endif
+#ifdef SP_PW
+#	include <pipewire/pipewire.h>
+#	include <spa/param/audio/format-utils.h>
+#	include <spa/utils/result.h>
+#endif
+#ifdef SP_WAS
+#	include <audiopolicy.h>
+#endif
+#if defined(SP_SIO) || defined(SP_WAS)
+#	include <speex/speex_resampler.h>
+#	define USE_RESAMPLE
 #endif
 
 typedef struct S S;
@@ -32,7 +43,9 @@ typedef struct {
 	pthread_t thrd;
 	pthread_mutex_t mtx;
 	pthread_cond_t cnd;
+#ifdef USE_RESAMPLE
 	SpeexResamplerState *src;
+#endif
 	RingBuf rb;
 	Cfg orig;
 	bool stop;
@@ -40,11 +53,13 @@ typedef struct {
 
 struct S {
 	void *p;
+	char name[MAX_NAME];
 	RingBuf rb;
 	pthread_mutex_t mtx;
 	Cfg cfg;
 	u64 t;
-	u32 idx, ctr, underrun, overrun, printctr, clipped, lastthres, slack;
+	u32 idx, namesz, ctr, underrun, overrun, pauseheur, clipped, lastthres,
+	    slack;
 	f32 vols[MAX_CHANNELS];
 	PlayState ps;
 	struct sockaddr sa;
@@ -57,67 +72,65 @@ static u32 toms(u32 bsz, Cfg cfg)
 	return bsz / framesz(cfg) * 1000 / cfg.rate;
 }
 
-static bool play(S *s, u32 frames, void *out)
+static u32 play(S *s, u32 nframes, u32 avgframes, void *out, bool fill)
 {
 	u8 buf[BUF_SZ];
 	u32 fsz = framesz(s->cfg), /* TODO: put in lock */
-	    need = (u32)frames * fsz;
+	    need = nframes * fsz,
+	    avgneed = avgframes * fsz;
 	if (s->ps != PLAY_PLAY) {
-		memset(out, 0, need);
-		return false;
+		if (fill) {
+			memset(out, 0, need);
+			return need;
+		} else
+			return 0;
 	}
 	pthread_mutex_lock(&s->mtx);
 	u32 readable = ringbuf_readable(&s->rb), read = 0,
 	    base = s->cfg.bufsz * fsz,
 	    slack = s->cfg.rate / 1000 * s->slack * fsz,
-	    thres = base + MAX(slack, 2 * need);
-#if __unix__ /* printing on win is really slow */
-	if (thres != s->lastthres)
-		INFO("[%u]: drop thres: %u ms", s->idx, toms(thres, s->cfg));
+	    thres = base + MAX(slack, 2 * avgneed);
+#ifdef SP_DEBUG
+	i32 thresms = (i32)toms(thres, s->cfg),
+	    lastthresms = (i32)toms(s->lastthres, s->cfg);
+	if (abs(thresms -  lastthresms) >= 2)
+		DEBUG("[%s]: drop thres: %u ms", s->name, toms(thres, s->cfg));
 #endif
 	s->lastthres = thres;
 	if (readable > thres) {
-		u32 leave = base + need;
+		u32 leave = base + avgneed;
 		read = ringbuf_read(
 			&s->rb, buf, MIN(readable - leave, readable));
-		WARN("[%u]: drop: %u ms - %u ms = %u ms (thres: %u ms)",
-		     s->idx, toms(readable, s->cfg),
+		WARN("[%s]: drop: %u ms - %u ms = %u ms (thres: %u ms)",
+		     s->name, toms(readable, s->cfg),
 		     toms(readable - leave, s->cfg), toms(leave, s->cfg),
 		     toms(thres, s->cfg));
 	} else
 		read = ringbuf_read(&s->rb, buf, need);
 	pthread_mutex_unlock(&s->mtx);
-	if (read < need) { 
-		if (s->printctr < 300)
-			WARN("[%u]: underrun (%u)", s->idx, ++s->underrun);
-		s->printctr += 100;
+	if (read < need && fill) {
+		if (s->pauseheur < 2000)
+			WARN("[%s]: underrun (%u)", s->name, ++s->underrun);
+		else
+			s->ps = PLAY_PAUSE;
+		s->pauseheur += 100;
 	} else if (read > need) {
 		read = need;
 	} else
-		s->printctr = (u32)MAX((i32)s->printctr - 1, 0);
+		s->pauseheur = (u32)MAX((i32)s->pauseheur - 1, 0);
 	memcpy(out, buf, read);
-	memset((u8*)out + read, 0, need - read);
-	return true;
+	if (fill)
+		memset((u8*)out + read, 0, need - read);
+	return read;
 }
-
-typedef struct {
-	struct SoundIoOutStream *os;
-	u8 buf[BUF_SZ]; /* jack backend stack overflows so put it on heap */
-} SioParam;
-
-typedef struct {
-	Inst b;
-	struct SoundIo *sio;
-	struct SoundIoDevice *dev;
-} SioInst;
 
 static f32 kcvt(u32 bits)
 {
-	return 1.0f / (f32)((1u << (bits - 1)) - 1);
+	return 1.0f / (f32)((1u << (bits - 1)));
 }
 
 /* maybe support big-endian properly ? */
-static f32 s8tof32(void *p) { return (f32)*(i8*)p * kcvt(8); }
+static f32 loadf32(void *p) { return *(f32*)p; }
 static f32 s16tof32(void *p) { return (f32)*(i16*)p * kcvt(16); }
 static f32 s32tof32(void *p) { return (f32)*(i32*)p * kcvt(32); }
 static f32 s24tof32(void *p)
@@ -128,6 +141,15 @@ static f32 s24tof32(void *p)
 	return (f32)v * kcvt(24);
 }
 
+static void bitcvt(f32 *out, u8 *in, u32 bsz, u32 bytedepth)
+{
+	f32 (*fnt[])(void*) = {s16tof32, s24tof32, s32tof32},
+	    (*load)(void*) = fnt[bytedepth - 2];
+	for (u32 i = 0, j = 0; i < bsz; i += bytedepth, ++j)
+		out[j] = load(in + i);
+}
+
+#ifdef USE_RESAMPLE
 static void dstrrsreal(Resample *rs)
 {
 	speex_resampler_destroy(rs->src);
@@ -140,14 +162,6 @@ static void dstrrs(Resample *rs)
 	rs->stop = true;
 	pthread_mutex_unlock(&rs->mtx);
 	pthread_cond_signal(&rs->cnd);
-}
-
-static void bitcvt(f32 *out, u8 *in, u32 bsz, u32 bytedepth)
-{
-	f32 (*fnt[])(void*) = {s8tof32, s16tof32, s24tof32, s32tof32},
-	    (*load)(void*) = fnt[bytedepth - 1];
-	for (u32 i = 0, j = 0; i < bsz; i += bytedepth, ++j)
-		out[j] = load(in + i);
 }
 
 static void *rsproc(void *p)
@@ -176,7 +190,7 @@ static void *rsproc(void *p)
 		speex_resampler_process_interleaved_float(
 			rs->src, f, &nin, out, &nout);
 		if (nin != nframes)
-			WARN("[%u]: resampled frames not equal", rs->s->idx);
+			WARN("[%s]: resampled frames not equal", rs->s->name);
 		pthread_mutex_lock(&rs->s->mtx);
 		ringbuf_write(&rs->s->rb, out, nout * ofsz);
 		if (rs->s->fullymade)
@@ -189,8 +203,8 @@ static void *rsproc(void *p)
 
 static void makers(S *s, Inst *inst, u32 outrate)
 {
-	INFO("[%u]: input sample rate (%u) not equal to device sample rate "
-	     "(%u), using resampler", s->idx, s->cfg.rate, outrate);
+	INFO("[%s]: input sample rate (%u) not equal to device sample rate "
+	     "(%u), using resampler", s->name, s->cfg.rate, outrate);
 	Resample *rs = s->rs = malloc(sizeof(*s->rs));
 	*rs = (Resample){
 		.s = s,
@@ -202,12 +216,13 @@ static void makers(S *s, Inst *inst, u32 outrate)
 	int err;
 	rs->src = speex_resampler_init(s->cfg.channels, s->cfg.rate, outrate,
 				       (int)inst->pcfg.rsqual, &err);
-	CHK(!err, "[%u]: make resampler", s->idx);
+	CHK(!err, "[%s]: make resampler", s->name);
 	s->cfg.rate = outrate;
 	s->cfg.isfloat = true;
 	s->cfg.bytes = 4;
 	pthread_create(&rs->thrd, NULL, rsproc, rs);
 }
+#endif
 
 static u32 strhash(const char *s)
 {
@@ -221,11 +236,24 @@ static u32 strhash(const char *s)
 }
 
 /* libsoundio { */
-#ifndef _WIN32
+#ifdef SP_SIO
+typedef struct {
+	struct SoundIoOutStream *os;
+	u8 buf[BUF_SZ]; /* jack backend stack overflows so put it on heap */
+	f32 avg;
+	u32 n;
+} SioParam;
+
+typedef struct {
+	Inst b;
+	struct SoundIo *sio;
+	struct SoundIoDevice *dev;
+} SioInst;
+
 static void siowrite(S *s, struct SoundIoChannelArea *ar, u8 *buf, u32 nfr,
 		     u32 mch, u32 nch, u32 bytes, f32 (*cvt)(void*))
 {
-	bool clipped = false;
+	bool hasclipped = false;
 	f32 k = 1.0f / (f32)mch;
 	for (u32 i = 0; i < nfr; ++i) {
 		f32 avg = 0.0f;
@@ -234,38 +262,34 @@ static void siowrite(S *s, struct SoundIoChannelArea *ar, u8 *buf, u32 nfr,
 			f32 raw = cvt(buf) * s->vols[ch],
 			    clamped = fmaxf(fminf(raw, 1.0f), -1.0f);
 			avg += *(f32*)(void*)ar[ch].ptr = clamped;
-			clipped |= raw != clamped;
+			hasclipped |= raw != clamped;
 		}
 		avg *= k;
 		for (u32 ch = mch; ch < nch; ar[ch].ptr += ar[ch].step, ++ch)
 			*(f32*)(void*)ar[ch].ptr = avg;
 	}
-	if (clipped)
-		WARN("[%u]: clipping (%u)", s->idx, ++s->clipped);
+	if (hasclipped)
+		WARN("[%s]: clipping (%u)", s->name, ++s->clipped);
 }
 
-static u8 zeros[65536] = {0};
+static u8 zeros[BUF_SZ] = {0};
 
-static f32 loadf32(void *p)
-{
-	return *(f32*)p;
-}
-
-static bool sioplayonce(S *s, struct SoundIoOutStream *os, int rem, int *played)
+static bool sioplayonce(S *s, SioParam *p, struct SoundIoOutStream *os, i32 rem,
+			int *played)
 {
 	int nframes = rem;
 	struct SoundIoChannelArea *ar;
 	int err = soundio_outstream_begin_write(os, &ar, &nframes);
 	if (err)
-		DIE("[%u]: stream error", err);
+		DIE("[%s]: stream error: %s", s->name, soundio_strerror(err));
 	if (!nframes)
 		return false;
 	*played = nframes;
 	const struct SoundIoChannelLayout *lo = &os->layout;
 	u8 *buf;
 	if (s->ps == PLAY_PLAY) {
-		buf = ((SioParam*)s->p)->buf;
-		play(s, (u32)nframes, buf);
+		buf = p->buf;
+		play(s, (u32)nframes, (u32)p->avg, buf, true);
 	} else
 		buf = zeros;
 	u32 nch = (u32)lo->channel_count, mch = MIN(s->cfg.channels, nch),
@@ -277,14 +301,14 @@ static bool sioplayonce(S *s, struct SoundIoOutStream *os, int rem, int *played)
 		case 4: siowrite(s, ar, buf, nfr, mch, nch, 4, s32tof32); break;
 		case 3: siowrite(s, ar, buf, nfr, mch, nch, 3, s24tof32); break;
 		case 2: siowrite(s, ar, buf, nfr, mch, nch, 2, s16tof32); break;
-		case 1: siowrite(s, ar, buf, nfr, mch, nch, 1, s8tof32); break;
+		default: DIE("unsupported bit depth");
 		}
 	}
 	err = soundio_outstream_end_write(os);
 	if (err == SoundIoErrorUnderflow)
 		return false;
 	else if (err)
-		DIE("[%u]: stream error", s->idx);
+		DIE("[%s]: stream error", s->name);
 	return true;
 }
 
@@ -292,8 +316,10 @@ static void sioplay(struct SoundIoOutStream *os, int framesmin, int framesmax)
 {
 	(void)framesmin;
 	S *s = os->userdata;
-	for (int rem = framesmax, played; rem > 0; rem -= played) {
-		if (!sioplayonce(s, os, rem, &played))
+	SioParam *p = s->p;
+	p->avg += ((f32)framesmax - p->avg) / (f32)++p->n;
+	for (i32 rem = framesmax, played; rem > 0; rem -= played) {
+		if (!sioplayonce(s, p, os, rem, &played))
 			break;
 	}
 }
@@ -302,22 +328,34 @@ static void siomake(Inst *inst, S *s)
 {
 	SioInst *g = (void*)inst;
 	SioParam *p = s->p = malloc(sizeof(*p));
+	*p = (SioParam){
+		.avg = 0.0f,
+		.n = 0
+	};
 	p->os = soundio_outstream_create(g->dev);
-	CHK(p->os, "[%u]: make outstream", s->idx);
+	CHK(p->os, "[%s]: make outstream", s->name);
 	p->os->format = SoundIoFormatFloat32LE;
 	p->os->software_latency = g->dev->software_latency_min;
+	/* need to remove colons */
+	for (char *c = s->name, *e = s->name + s->namesz; c != e; ++c)
+		*c = *c == ':' ? ' ' : *c;
+	p->os->name = s->name;
+	/* for some reason pipewire seems to like to give a low latency that it
+	 * can't actually play on alsa, so manually clamp the value */
+	if (strcmp(g->dev->name, "PipeWire Sound Server") == 0)
+		p->os->software_latency =  fmax(p->os->software_latency, 0.002);
 	p->os->write_callback = sioplay;
 	p->os->sample_rate = (int)s->cfg.rate;
 	p->os->userdata = s;
 	int err;
 	err = soundio_outstream_open(p->os);
-	CHK(!err, "[%u]: open outstream", s->idx);
+	CHK(!err, "[%s]: open outstream", s->name);
 	if ((u32)p->os->sample_rate != s->cfg.rate)
 		makers(s, inst, (u32)p->os->sample_rate);
 	if (p->os->layout_error)
-		DIE("[%u]: layout error", s->idx);
+		DIE("[%s]: layout error", s->name);
 	err = soundio_outstream_start(p->os);
-	CHK(!err, "[%u]: start outstream", s->idx);
+	CHK(!err, "[%s]: start outstream", s->name);
 }
 
 static void siodstr(Inst *inst, S *s)
@@ -389,18 +427,274 @@ static Inst *sioinst(Pcfg pcfg, enum SoundIoBackend backend, u32 devhash,
 	if (r == 0) {
 		const char *name =
 			soundio_backend_name(g->sio->current_backend);
-		INFO("selected backend: %s", name);
+		INFO("libsoundio: selected backend: %s", name);
 	}
 	CHK(r == 0, "connect to backend");
 	soundio_flush_events(g->sio);
 	siofinddev(g, devhash, listdev);
-	return (Inst*)g;
+	return &g->b;
 }
 #endif
 /* } libsoundio */
 
+/* pipewire { */
+#ifdef SP_PW
+typedef struct {
+	Inst b;
+	struct pw_thread_loop *loop;
+	struct pw_context *ctx;
+	struct pw_core *core;
+	struct pw_registry *reg;
+	struct spa_hook corelstn;
+	const char *dev;
+} PwInst;
+
+typedef struct {
+	S *s;
+	struct pw_stream *stream;
+	struct spa_hook streamlstn;
+} PwParam;
+
+/* interleaved -> f32 planar */
+static void pwcvt(S *s, f32 **outs, u8 *in, u32 bsz, Cfg cfg)
+{
+	f32 (*fnt[])(void*) = {s16tof32, s24tof32, s32tof32, loadf32},
+	    (*load)(void*) = fnt[cfg.bytes - 2 + cfg.isfloat];
+	bool hasclipped = false;
+	u32 fsz = framesz(cfg);
+	for (u32 i = 0; i < cfg.channels; ++i) {
+		for (u8 *b = in + i * cfg.bytes, *e = b + bsz; b < e;
+		     b += fsz, ++outs[i]) {
+			f32 raw = load(b) * s->vols[i],
+			    clamped = fmaxf(fminf(raw, 1.0f), -1.0f);
+			hasclipped |= raw != clamped;
+			*outs[i] = clamped;
+		}
+	}
+	if (hasclipped)
+		WARN("[%s]: clipping (%u)", s->name, ++s->clipped);
+}
+
+static void pwproc(void *userdata)
+{
+	PwParam *p = userdata;
+	struct pw_buffer *pb = pw_stream_dequeue_buffer(p->stream);
+	if (pb == NULL) {
+		WARN("[%s]: out of buffers", p->s->name);
+		return;
+	}
+	struct spa_buffer *sb = pb->buffer;
+	f32 *dsts[MAX_CHANNELS];
+	u32 ofsz = sizeof(f32) * p->s->cfg.channels,
+	    nframes = sb->datas->maxsize / ofsz;
+	nframes = MIN(nframes, (u32)pb->requested);
+	for (u32 i = 0; i < sb->n_datas; ++i) {
+		if ((dsts[i] = sb->datas[i].data) == NULL)
+			return;
+		sb->datas[i].chunk->offset = 0;
+		sb->datas[i].chunk->stride = sizeof(f32);
+		sb->datas[i].chunk->size = nframes * sizeof(f32);
+	}
+	u8 buf[BUF_SZ];
+	u32 read = play(p->s, nframes, nframes, buf, true);
+	pwcvt(p->s, dsts, buf, read, p->s->cfg);
+	pw_stream_queue_buffer(p->stream, pb);
+}
+
+static const struct pw_stream_events streamevts = {
+        PW_VERSION_STREAM_EVENTS,
+	.process = pwproc,
+};
+
+static enum spa_audio_format pwfmt(Cfg cfg)
+{
+	(void)cfg;
+	return SPA_AUDIO_FORMAT_F32P;
+}
+
+static void pwmake(Inst *inst, S *s)
+{
+	PwInst *g = (void*)inst;
+	PwParam *p = s->p = malloc(sizeof(*p));
+	*p = (PwParam){
+		.s = s,
+		.streamlstn = {0}
+	};
+	struct pw_properties *props = pw_properties_new(
+		PW_KEY_NODE_NAME, s->name,
+		PW_KEY_MEDIA_TYPE, "Audio",
+		PW_KEY_MEDIA_CATEGORY, "Playback",
+		PW_KEY_TARGET_OBJECT, g->dev,
+		NULL);
+	u8 pbbuf[1024];
+	struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(pbbuf, sizeof(pbbuf));
+	const struct spa_pod *params[1];
+	params[0] = spa_format_audio_raw_build(
+		&pb, SPA_PARAM_EnumFormat, &SPA_AUDIO_INFO_RAW_INIT(
+			.format = pwfmt(s->cfg),
+			.channels = s->cfg.channels,
+			.rate = s->cfg.rate
+		));;
+	pw_thread_loop_lock(g->loop);
+	p->stream = pw_stream_new(g->core, "audio-src", props);
+	CHK(p->stream, "[%s]: make stream", s->name);
+	pw_stream_add_listener(p->stream, &p->streamlstn, &streamevts, p);
+	CHK(pw_stream_connect(
+		p->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+		(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+		 PW_STREAM_FLAG_RT_PROCESS),
+		params, 1) >= 0,
+	    "[%s]: connect to stream", s->name);
+	pw_thread_loop_unlock(g->loop);
+}
+
+static void pwdstr(Inst *inst, S *s)
+{
+	PwInst *g = (void*)inst;
+	PwParam *p = s->p;
+	pw_thread_loop_lock(g->loop);
+	pw_stream_destroy(p->stream);
+	pw_thread_loop_unlock(g->loop);
+	free(p);
+}
+
+static void pwupdate(Inst *inst, S *s)
+{
+	(void)inst, (void)s;
+}
+
+static void pwdone(void *data, uint32_t it, int seq)
+{
+	(void)it, (void)seq;
+	pw_thread_loop_signal(data, false);
+}
+
+static const struct pw_core_events pwfinddevcoreevts = {
+	.version = PW_VERSION_CORE_EVENTS,
+	.done = pwdone
+};
+
+typedef struct {
+	PwInst *g;
+	const char *dev;
+	u32 devhash;
+	bool listdev;
+} PwFindDev;
+
+static void pwfinddevglobal(void *data, uint32_t id, uint32_t permissions,
+			    const char *type, uint32_t version,
+			    const struct spa_dict *props)
+
+{
+	(void)id, (void)permissions, (void)version;
+	PwFindDev *p = data;
+	if (p->g->dev && !p->listdev)
+		return;
+	if (!props || strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+		return;
+	const char *class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+	if (!class || strcmp(class, "Audio/Sink") != 0)
+		return;
+	const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+	if (!name)
+		return;
+	const char *desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+	u32 hash = mix(strhash(name)) >> 48;
+	if (p->listdev) {
+		INFO("%04X: %s (%s)", hash, desc ? desc : name,
+		     desc ? name : "");
+		return;
+	}
+	if ((hash == p->devhash || p->devhash == 0)) {
+		p->g->dev = name;
+		INFO("selected device: %s (%s)", desc ? desc : name,
+		     desc ? name : "");
+	}
+}
+
+static const struct pw_registry_events finddevregevts = {
+	.version = PW_VERSION_REGISTRY_EVENTS,
+	.global = pwfinddevglobal
+};
+
+static void pwfinddev(PwInst *g, u32 devhash, bool listdev)
+{
+	g->dev = NULL;
+	struct spa_hook corelstn = {0};
+	CHK(pw_core_add_listener(
+		g->core, &corelstn, &pwfinddevcoreevts, g->loop) >= 0,
+	    "add finddev core listener");
+	struct pw_registry *reg = pw_core_get_registry(
+		g->core, PW_VERSION_REGISTRY, 0);
+	CHK(reg, "get registry");
+	pw_core_sync(g->core, 0, 0);
+	struct spa_hook reglstn = {0};
+	PwFindDev p = {
+		.g = g,
+		.devhash = devhash,
+		.listdev = listdev,
+	};
+	int r = pw_registry_add_listener(
+		reg, &reglstn, &finddevregevts, &p);
+	CHK(r >= 0, "add finddev registry listener");
+	pw_thread_loop_wait(g->loop);
+	if (!g->dev && !listdev)
+		DIE("no devices found");
+	spa_hook_remove(&reglstn);
+	pw_proxy_destroy((struct pw_proxy*)reg);
+	spa_hook_remove(&corelstn);
+}
+
+static void pwcoreerror(void *data, uint32_t id, int seq, int res,
+			const char *message)
+{
+	(void)data, (void)id, (void)seq;
+	DIE("pipewire error: %s, %s", spa_strerror(res), message);
+}
+
+static const struct pw_core_events pwcoreevts = {
+	.version = PW_VERSION_CORE_EVENTS,
+	.error = pwcoreerror
+};
+
+static Inst *pwinst(Pcfg pcfg, u32 devhash, bool listdev)
+{
+	PwInst *g = malloc(sizeof(*g));
+	*g = (PwInst){
+		.b = {
+			.pcfg = pcfg,
+			.make = pwmake,
+			.dstr = pwdstr,
+			.update = pwupdate
+		},
+		.corelstn = {0}
+	};
+        pw_init(NULL, NULL);
+	g->loop = pw_thread_loop_new("sp-recv-pipewire", NULL);
+	pw_thread_loop_lock(g->loop);
+	CHK(pw_thread_loop_start(g->loop) >= 0, "start thread loop");
+	g->ctx = pw_context_new(pw_thread_loop_get_loop(g->loop),
+				pw_properties_new(PW_KEY_CONFIG_NAME,
+						  "client-rt.conf", NULL), 0);
+	CHK(g->ctx, "make context");
+	g->core = pw_context_connect(g->ctx, NULL, 0);
+	CHK(g->ctx, "connect to pipewire");
+	int r = pw_core_add_listener(
+		g->core, &g->corelstn, &pwcoreevts, NULL);
+	CHK(r >= 0, "add core listener");
+	pwfinddev(g, devhash, listdev);
+	pw_thread_loop_unlock(g->loop);
+        return &g->b;
+}
+#endif
+/* } pipewire */
+
+/* I think libsoundio's WASAPI backend is really poor. I get 100% CPU on the
+ * 'sio_sine' example from them. Also doesn't have support for IAudioClient3.
+ * So use our own implementation. */
+
 /* wasapi { */
-#ifdef _WIN32
+#ifdef SP_WAS
 typedef struct {
 	Inst b;
 	IMMDevice *dev;
@@ -408,10 +702,12 @@ typedef struct {
 
 typedef struct {
 	IAudioClient3 *c;
+	IAudioSessionControl *sc;
 	IAudioRenderClient *rc;
 	SRWLOCK srw;
 	HANDLE evt, thrd;
-	u32 evtto, bufsz;
+	u32 evtto, bufsz, n;
+	f32 avg;
 	bool stop;
 } WasParam;
 
@@ -441,7 +737,7 @@ static bool wasplayonce(S *s, WasParam *p)
 {
 	DWORD r = WaitForSingleObjectEx(p->evt, p->evtto, FALSE);
 	if (r == WAIT_FAILED) {
-		WARN("[%u]: failed to wait for buffer", s->idx);
+		WARN("[%s]: failed to wait for buffer", s->name);
 		return true;
 	}
 	AcquireSRWLockExclusive(&p->srw);
@@ -450,14 +746,15 @@ static bool wasplayonce(S *s, WasParam *p)
 	u32 padding;
 	HRESULT hr = F(p->c, GetCurrentPadding, &padding);
 	if (FAILED(hr))
-		DIE("[%u]: GetCurrentPadding failed", s->idx);
+		DIE("[%s]: GetCurrentPadding failed", s->name);
 	u32 nframes = p->bufsz - padding;
 	u8 *frames;
 	hr = F(p->rc, GetBuffer, nframes, &frames);
 	if (FAILED(hr))
-		DIE("[%u]: GetBuffer failed", s->idx);
+		DIE("[%s]: GetBuffer failed", s->name);
 	u8 buf[BUF_SZ];
-	play(s, nframes, buf);
+	p->avg += ((f32)nframes - p->avg) / (f32)++p->n;
+	play(s, nframes, (u32)p->avg, buf, true);
 	f32 out[BUF_SZ / sizeof(f32)], *f = out;
 	u32 ifsz = framesz(s->cfg),
 	    ofsz = sizeof(f32) * s->cfg.channels;
@@ -465,19 +762,20 @@ static bool wasplayonce(S *s, WasParam *p)
 		bitcvt(f, buf, nframes * ifsz, s->cfg.bytes);
 	else 
 		f = (f32*)buf;
-	bool clipped = false;
+	bool hasclipped = false;
 	for (u32 i = 0; i < nframes * s->cfg.channels;) {
 		for (u32 j = 0; j < s->cfg.channels; ++i, ++j) {
 			f32 raw = f[i] * s->vols[j],
 			    clamped = fmaxf(fminf(raw, 1.0f), -1.0f);
-			clipped |= raw != clamped;
+			hasclipped |= raw != clamped;
 		}
 	}
-	if (clipped)
-		WARN("[%u]: clipping (%u)", s->idx, ++s->clipped);
+	if (hasclipped)
+		WARN("[%s]: clipping (%u)", s->name, ++s->clipped);
 	memcpy(frames, f, ofsz * nframes);
 	F(p->rc, ReleaseBuffer, nframes, 0);
 	ReleaseSRWLockExclusive(&p->srw);
+	(void)loadf32; /* unused */
 	return true;
 }
 
@@ -487,6 +785,17 @@ static DWORD WINAPI wasplay(LPVOID p_)
 	WasParam *p = s->p;
 	while (wasplayonce(s, p));
 	return 0;
+}
+
+static u32 waswcstomb(char dst[MAX_NAME], const wchar_t *src)
+{
+	return WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, MAX_NAME - 1,
+				   NULL, NULL);
+}
+
+static u32 wasmbtowcs(wchar_t dst[MAX_NAME], const char *src)
+{
+	return MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, MAX_NAME - 1);
 }
 
 static void wasmake(Inst *inst, S *s)
@@ -513,25 +822,31 @@ static void wasmake(Inst *inst, S *s)
 	UINT32 def, fund, min, max;
 	hr = F(p->c, GetSharedModeEnginePeriod, (WAVEFORMATEX*)&wf, &def, &fund,
 	       &min, &max);
-	CHKH(hr, "[%u]: get engine period", s->idx);
+	CHKH(hr, "[%s]: get engine period", s->name);
 	hr = F(p->c, InitializeSharedAudioStream,
 	       AUDCLNT_STREAMFLAGS_EVENTCALLBACK, min, (WAVEFORMATEX*)&wf,
 	       NULL);
-	CHKH(hr, "[%u]: make audio client", s->idx);
+	CHKH(hr, "[%s]: make client", s->name);
 	REFERENCE_TIME defperiod, minperiod;
 	hr = F(p->c, GetDevicePeriod, &defperiod, &minperiod);
-	CHKH(hr, "[%u]: get device period", s->idx);
+	CHKH(hr, "[%s]: get device period", s->name);
 	p->evtto = (u32)(minperiod / 1000);
 	UINT32 bufsz;
 	hr = F(p->c, GetBufferSize, &bufsz);
-	CHKH(hr, "[%u]: get buffer size", s->idx);
+	CHKH(hr, "[%s]: get buffer size", s->name);
 	p->bufsz = (u32)bufsz;
+	hr = F(p->c, GetService, &IID_IAudioSessionControl, (void**)&p->sc);
+	CHKH(hr, "[%s]: get session control", s->name);
+	wchar_t name[MAX_NAME];
+	wasmbtowcs(name, s->name);
+	hr = F(p->sc, SetDisplayName, name, NULL);
+	CHKH(hr, "[%s]: set session name", s->name);
 	hr = F(p->c, GetService, &IID_IAudioRenderClient, (void**)&p->rc);
-	CHKH(hr, "[%u]: get render client", s->idx);
+	CHKH(hr, "[%s]: get render client", s->name);
 	p->evt = CreateEventW(NULL, FALSE, FALSE, NULL);
-	CHK(p->evt, "[%u]: make event", s->idx);
+	CHK(p->evt, "[%s]: make event", s->name);
 	hr = F(p->c, SetEventHandle, p->evt);
-	CHKH(hr, "[%u]: set event handle", s->idx);
+	CHKH(hr, "[%s]: set event handle", s->name);
 	p->thrd = CreateThread(NULL, 0, wasplay, s, 0, NULL);
 	F(p->c, Start);
 }
@@ -547,6 +862,7 @@ static void wasdstr(Inst *inst, S *s)
 	WaitForSingleObject(p->thrd, INFINITE);
 	CloseHandle(p->evt);
 	F(p->rc, Release);
+	F(p->sc, Release);
 	F(p->c, Release);
 	if (s->rs)
 		dstrrs(s->rs);
@@ -558,15 +874,7 @@ static void wasupdate(Inst *inst, S *s)
 	(void)inst, (void)s;
 }
 
-enum {WAS_STR_SZ = 512};
-
-static u32 wcscvt(char dst[WAS_STR_SZ], const wchar_t *src)
-{
-	return WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, WAS_STR_SZ - 1,
-				   NULL, NULL);
-}
-
-static u32 devname(IMMDevice *dev, char out[WAS_STR_SZ])
+static u32 wasdevname(IMMDevice *dev, char out[MAX_NAME])
 {
 	IPropertyStore *ps;
 	HRESULT hr = F(dev, OpenPropertyStore, STGM_READ, &ps);
@@ -575,7 +883,7 @@ static u32 devname(IMMDevice *dev, char out[WAS_STR_SZ])
 	PROPVARIANT name;
 	PropVariantInit(&name);
 	F(ps, GetValue, &PKEY_DeviceInterface_FriendlyName, &name);
-	u32 sz = wcscvt(out, name.pwszVal);
+	u32 sz = waswcstomb(out, name.pwszVal);
 	PropVariantClear(&name);
 	F(ps, Release);
 	return sz;
@@ -605,12 +913,12 @@ static void wasfinddev(WasInst *g, IMMDeviceEnumerator *devenum, u32 devhash,
 		hr = F(dev, GetId, &wid);
 		if (FAILED(hr))
 			goto next;
-		char id[WAS_STR_SZ];
-		u32 idsz = wcscvt(id, wid),
+		char id[MAX_NAME];
+		u32 idsz = waswcstomb(id, wid),
 		    hash = mix(strhash(id)) >> 48;
 		CoTaskMemFree(wid);
-		char name[WAS_STR_SZ];
-		u32 sz = devname(dev, name);
+		char name[MAX_NAME];
+		u32 sz = wasdevname(dev, name);
 		if (listdev)
 			INFO("%04X: %.*s (%.*s)", hash, sz, name, idsz, id);
 		if (hash == devhash) {
@@ -625,8 +933,8 @@ static void wasfinddev(WasInst *g, IMMDeviceEnumerator *devenum, u32 devhash,
 	if (!g->dev && devhash)
 		DIE("specified device hash not found");
 sel:;
-	char name[WAS_STR_SZ];
-	u32 sz = devname(g->dev, name);
+	char name[MAX_NAME];
+	u32 sz = wasdevname(g->dev, name);
 	INFO("selected device: %.*s", sz, name);
 }
 
@@ -647,14 +955,17 @@ static Inst *wasinst(Pcfg pcfg, u32 devhash, bool listdev)
 	CHKH(hr, "make device enumerator");
 	wasfinddev(g, devenum, devhash, listdev);
 	F(devenum, Release);
-	return (void*)g;
+	return &g->b;
 }
 #endif
 /* } wasapi */
 
-static void make(S *s, u32 idx, u32 slack, Cfg cfg, struct sockaddr *sa)
+static void make(S *s, u32 idx, const char *name, u32 namesz, u32 slack,
+		 Cfg cfg, struct sockaddr *sa)
 {
 	*s = (S){
+		.name = {0},
+		.namesz = namesz,
 		.rb = {0},
 		.cfg = cfg,
 		.t = 0,
@@ -662,7 +973,7 @@ static void make(S *s, u32 idx, u32 slack, Cfg cfg, struct sockaddr *sa)
 		.ctr = 0,
 		.underrun = 0,
 		.overrun = 0,
-		.printctr = 0,
+		.pauseheur = 0,
 		.clipped = 0,
 		.lastthres = 0,
 		.slack = slack,
@@ -670,12 +981,14 @@ static void make(S *s, u32 idx, u32 slack, Cfg cfg, struct sockaddr *sa)
 		.sa = *sa,
 		.fullymade = false,
 		.logged = false,
-		.rs = NULL
+		.rs = NULL,
 	};
-	INFO("[%u]: making new client", idx);
+	memcpy(s->name, name, namesz);
+	INFO("[%u]: making new client: %.*s", idx, namesz, name);
 	for (u32 i = 0; i < MAX_CHANNELS; ++i)
 		s->vols[i] = 1.0f;
-	CHK(pthread_mutex_init(&s->mtx, NULL) == 0, "[%u]: make mutex", idx);
+	CHK(pthread_mutex_init(&s->mtx, NULL) == 0, "[%s]: make mutex",
+	    s->name);
 }
 
 static void dstr(S *s)
@@ -751,7 +1064,7 @@ static void handleslow(SlowProc *p, SlowEntry e)
 		int r = (int)sendto(p->sfd, (const void*)&v, sizeof(v), 0,
 				    &e.s->sa, sizeof(struct sockaddr_in));
 		if (r == -1)
-			WARN("[%u]: error sending response to prep", e.s->idx);
+			WARN("[%s]: error sending response to prep", e.s->name);
 	}
 }
 
@@ -808,15 +1121,30 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 {
 	struct sockaddr sa;
 	socklen_t sasz = sizeof(sa);
-	u8 buf[BUF_SZ], *b = buf + HDR_SZ;
+	u8 buf[BUF_SZ], *b = buf;
 	int read = (int)recvfrom(sfd, (char*)buf, BUF_SZ, 0, &sa, &sasz);
-	if (read < HDR_SZ) {
+	if (read < HDR_SZ + 1) {
 		WARN("read less than header size (%u bytes)", read);
 		return;
 	}
+	u32 bsz = (u32)read;
 	Hdr hdr;
-	dechdr(buf, &hdr);
+	dechdr(b, &hdr);
+	b += HDR_SZ;
+	bsz -= HDR_SZ;
+	char name[MAX_NAME];
+	u32 namesz = 0;
+	for (char *c = (char*)b; *c; ++c, ++b)
+		name[namesz++] = *c;
+	bsz -= namesz + 1;
+	++b;
 	Cfg cfg = hdr.cfg;
+	if (cfg.isfloat)
+		cfg.bytes = 4;
+	if (cfg.bytes < 2 || cfg.bytes > 4) {
+		WARN("unsupported bit depth");
+		return;
+	}
 	u32 idx = ~0u;
 	bool makenew = false;
 	SlowCmd slowcmd;
@@ -832,7 +1160,7 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 		if (s->rs)
 			cmpcfg = s->rs->orig;
 		if (memcmp(&cmpcfg, &cfg, sizeof(cfg)) != 0) {
-			INFO("[%u]: client cfg has changed, remaking", s->idx);
+			INFO("[%s]: client cfg has changed, remaking", s->name);
 			dstr(&ss[idx]);
 			slowcmd = SLOW_REMAKE;
 			makenew = true;
@@ -862,7 +1190,7 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 			WARN("invalid config from connection, skipping...");
 			return;
 		}
-		make(s, idx, slack, cfg, &sa);
+		make(s, idx, name, namesz, slack, cfg, &sa);
 		enqslow(sl, (SlowEntry){
 			.s = s,
 			.slowcmd = slowcmd,
@@ -871,9 +1199,9 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 	}
 	if (s->fullymade) {
 		if (!s->logged) {
-			INFO("[%u]: client created: id = %08X, rate = %u, "
+			INFO("[%s]: client created: id = %08X, rate = %u, "
 			     "bits = %u, channels = %u, type = %s, "
-			     "buffer size: %u frames (%u ms)", idx, cfg.id,
+			     "buffer size: %u frames (%u ms)", s->name, cfg.id,
 			     cfg.rate, cfg.bytes * 8, cfg.channels,
 			     cfg.isfloat ? "f32" : "pcm",
 			     cfg.bufsz / framesz(cfg),
@@ -882,38 +1210,35 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 		}
 		inst->update(inst, s);
 	}
-	if (s->fullymade && !s->logged) {
-	}
 	pthread_mutex_lock(&s->mtx);
 	RingBuf *rb = !s->rs ? &s->rb : &s->rs->rb;
-	u32 bsz = (u32)read - HDR_SZ;
 	bool send = false;
 	switch (hdr.cmd) {
 	case CMD_RESET:
-		INFO("[%u]: reset", s->idx);
+		INFO("[%s]: reset", s->name);
 		ringbuf_reset(rb);
 		goto unlock;
 	case CMD_PAUSE:
-		INFO("[%u]: pause", s->idx);
+		INFO("[%s]: pause", s->name);
 		s->ps = PLAY_PAUSE;
 		goto unlock;
 	case CMD_START:
-		INFO("[%u]: start", s->idx);
+		INFO("[%s]: start", s->name);
 		s->ps = PLAY_PLAY;
 		goto unlock;
 	case CMD_PREP:
-		INFO("[%u]: prep", s->idx);
+		INFO("[%s]: prep", s->name);
 		s->ps = PLAY_WAIT;
 		goto unlock;
 	case CMD_RM:
 		if (s->fullymade) {
-			INFO("[%u]: remove", s->idx);
+			INFO("[%s]: remove", s->name);
 			rm(s, sl, taken, recycle, n);
 		}
 		goto unlock;
 	case CMD_VOL:
 		if (bsz < sizeof(f32)) {
-			WARN("[%u]: read not enough bytes for volume", s->idx);
+			WARN("[%s]: read not enough bytes for volume", s->name);
 			goto unlock;
 		}
 		for (u32 i = 0, ch = 0; i < bsz; i += sizeof(f32), ++ch) {
@@ -921,14 +1246,16 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 			memcpy(&vol, b, sizeof(vol));
 			if (vol >= 0.0f) {
 				s->vols[ch] = vol;
-				INFO("[%u]: set volume (channel %u) to %u%%",
-				     s->idx, i, (u32)(s->vols[ch] * 100.0f));
+				INFO("[%s]: set volume (channel %u) to %u%%",
+				     s->name, i, (u32)(s->vols[ch] * 100.0f));
 			}
 		}
 		goto unlock;
 	case CMD_SILENT:
-		if (bsz < sizeof(u32))
-			WARN("[%u]: read not enough bytes for silence", s->idx);
+		if (bsz < sizeof(u32)) {
+			WARN("[%s]: read not enough bytes for silence",
+			     s->name);
+		}
 		else {
 			u32 sz;
 			memcpy(&sz, b, sizeof(sz));
@@ -953,7 +1280,7 @@ unlock:
 		pthread_cond_signal(&s->rs->cnd);
 	u64 t = ns();
 	if (!quiet && s->t && (0 || s->ctr % 100 == 0)) {
-		INFO("[%u]: recv (%u): %u bytes - %u us", idx,
+		INFO("[%s]: recv (%u): %u bytes - %u us", s->name,
 		     s->ctr, read, (u32)(t - s->t) / 1000);
 	}
 	++s->ctr;
@@ -1006,7 +1333,7 @@ static void run(u16 port, Inst *inst, u32 slack, bool quiet)
 			idx = (u32)__builtin_ctz(idxs);
 			if (t < lastt[idx] + timeoutms) 
 				continue;
-			INFO("[%u]: timeout", ss[idx].idx);
+			INFO("[%s]: timeout", ss[idx].name);
 			rm(&ss[idx], &sl, &taken, &recycle, &n);
 		}
 	}
@@ -1016,18 +1343,30 @@ static void run(u16 port, Inst *inst, u32 slack, bool quiet)
 
 static void help(const char *argv)
 {
-#ifndef _WIN32
-#define BACKENDS "-o\tauto | alsa | jack | pulse = auto\n\t"
-#else
-#define BACKENDS
+	const char *s =
+		"options:\n\t-h\t(help)\n\t-q\t(no recv logging)\n\t"
+	     	"-d\tdevice hash\n\t-L\t(list devices)\n\t-o\t"
+#ifdef SP_SIO
+		"[alsa | jack | pulse] (libsoundio) "
+#ifdef SP_PW
+		"| "
 #endif
-	INFO("usage: %s <port> [options...]\n"
-	     "options:\n\t-h\t(help)\n\t-q\t(no recv logging)\n\t"
-	     "-d\tdevice hash\n\t-L\t(list devices)\n\t"
-	     BACKENDS
-	     "-s\tmin drop slack (ms) = 0 (auto)\n\t"
-	     "-r\tresampler quality (1 (lowest) - 10 (highest)) = 10\n\t",
-	     argv);
+#endif
+#ifdef SP_PW
+		"pipewire"
+#endif
+#ifdef SP_WAS
+		"wasapi"
+#endif
+		" = auto\n\t"
+	     	"-s\tmin drop slack (ms) = 0 (auto)\n\t"
+#ifdef USE_RESAMPLE
+	     	"-r\tresampler quality (1 (lowest) - 10 (highest), only for "
+		"libsoundio and WASAPI) = 9\n\t";
+#else
+	;
+#endif
+	INFO("usage: %s <port> [options...]\n%s", argv, s);
 }
 
 #define HELP()  do { \
@@ -1042,24 +1381,20 @@ int main(int argc, char *argv[])
 	char *end;
 	u32 port = (u32)strtoul(argv[1], &end, 10);
 	ASSERT(port > 0 && port < 0xFFFF);
-	u32 devhash = 0, slack = 0, rsqual = 0;
+	u32 devhash = 0, slack = 0, rsqual = 9;
 	bool quiet = false, listdev = false;
-	/* I think libsoundio's WASAPI backend is really poor. I get 100% CPU
-	 * usage on the 'sio_sine' example from them so use own WASAPI backend.
-	 * Also doesn't thave support for IAudioClient3 */
 	enum {
-#ifdef _WIN32
-		BACKEND_WAS
-#else
+#ifdef SP_SIO
 		BACKEND_SIO,
 #endif
-	} backend =
-#ifdef _WIN32
-		BACKEND_WAS;
-#else
-		BACKEND_SIO;
+#ifdef SP_PW
+		BACKEND_PW,
 #endif
-#ifndef _WIN32
+#ifdef SP_WAS
+		BACKEND_WAS,
+#endif
+	} backend = 0;
+#ifdef SP_SIO
 	enum SoundIoBackend sioback = SoundIoBackendNone;
 #endif
 	for (int i = 2; i < argc; ++i) {
@@ -1069,21 +1404,25 @@ int main(int argc, char *argv[])
 		case 'q':
 			quiet = true;
 			break;
-#ifndef _WIN32
 		case 'o':
 			if (++i >= argc)
 				HELP();
-			backend = BACKEND_SIO;
-			if (strcmp(argv[i], "alsa") == 0)
+			if (false) {}
+#ifdef SP_PW
+			else if (strcmp(argv[i], "pipewire") == 0)
+				backend = BACKEND_PW;
+#endif
+#ifdef SP_SIO
+			else if (strcmp(argv[i], "alsa") == 0)
 				sioback = SoundIoBackendAlsa;
 			else if (strcmp(argv[i], "jack") == 0)
 				sioback = SoundIoBackendJack;
 			else if (strcmp(argv[i], "pulse") == 0)
 				sioback = SoundIoBackendPulseAudio;
-			else if (strcmp(argv[i], "auto") != 0)
+			else
 				HELP();
-			break;
 #endif
+			break;
 		case 'd':
 			if (++i >= argc)
 				HELP();
@@ -1097,12 +1436,14 @@ int main(int argc, char *argv[])
 				HELP();
 			slack = (u32)strtoul(argv[i], &end, 10);
 			break;
+#ifdef USE_RESAMPLE
 		case 'r':
 			if (++i >= argc)
 				HELP();
 			rsqual = (u32)strtoul(argv[i], &end, 10);
 			ASSERT(rsqual >= 1 && rsqual <= 10);
 			break;
+#endif
 		case 'h':
 		default:
 			HELP();
@@ -1111,15 +1452,22 @@ int main(int argc, char *argv[])
 	Pcfg pcfg = {.rsqual = rsqual};
 	Inst *inst;
 	switch (backend) {
-#ifdef _WIN32
-	case BACKEND_WAS:
-		INFO("selected backend: WASAPI");
-		inst = wasinst(pcfg,  devhash, listdev);
-		break;
-#else
+#ifdef SP_SIO
 	case BACKEND_SIO:
 		INFO("selected backend: libsoundio");
 		inst = sioinst(pcfg, sioback, devhash, listdev);
+		break;
+#endif
+#ifdef SP_PW
+	case BACKEND_PW:
+		INFO("selected backend: pipewire");
+		inst =  pwinst(pcfg, devhash, listdev);
+		break;
+#endif
+#ifdef SP_WAS
+	case BACKEND_WAS:
+		INFO("selected backend: WASAPI");
+		inst = wasinst(pcfg,  devhash, listdev);
 		break;
 #endif
 	}

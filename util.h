@@ -52,7 +52,6 @@ typedef double f64;
 #define COUNTOF(x) (sizeof(x) / sizeof(*x))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
-#define LOGFILE stderr
 #define COLOR(c, h, p, s, ...) \
       fprintf(LOGFILE, "\x1B[" c "m\x1B[1m" h "\x1B[90m\x1B[1m" p "%s(%u)" \
               ":%s:\x1B[0m\t" s "\n", __FILE__, __LINE__, __func__, \
@@ -60,7 +59,13 @@ typedef double f64;
 #define INFO(s, ...) COLOR("32", "info", "    ", s, ##__VA_ARGS__)
 #define WARN(s, ...) COLOR("33", "warn", "    ", s, ##__VA_ARGS__)
 #define ERROR(s, ...) COLOR("31", "error", "   ", s, ##__VA_ARGS__)
-#define DEBUG(s, ...) COLOR("34", "debug", "   ", s, ##__VA_ARGS__)
+#ifdef SP_DEBUG
+#	define LOGFILE stderr
+#	define DEBUG(s, ...) COLOR("34", "debug", "   ", s, ##__VA_ARGS__)
+#else
+#	define LOGFILE stdout
+#	define DEBUG(...)
+#endif
 #define ABORT() exit(1)
 #define DIE(s, ...) do { \
 	ERROR(s, ##__VA_ARGS__); \
@@ -103,6 +108,7 @@ typedef struct {
 #define READ(v, p) memcpy(v, p, sizeof(*v)); p += sizeof(*v)
 
 enum {HDR_SZ = 4 + 4 + 4 + 4};
+enum {MAX_NAME = 256};
 
 inline static void enchdr(u8 *out, Hdr hdr)
 {
@@ -261,8 +267,13 @@ DEFINE_PROPERTYKEY(PKEY_DeviceInterface_FriendlyName, 0x026E516E, 0xB814,
 #define CHKH(x, s, ...) CHK(SUCCEEDED(x), s, ##__VA_ARGS__)
 #define F(ptr, fn, ...) ptr->lpVtbl->fn(ptr, ##__VA_ARGS__)
 #define PIPE_NAME L"\\\\.\\pipe\\sp-send-pipe"
-enum {PIPE_BUF_SZ = 256,
+enum {PIPE_BUF_SZ = 512,
       PIPE_TIMEOUT_MS = 5000};
+
+enum {
+	PIPE_NONE,
+	PIPE_PREP
+} PipeCmd;
 
 /* only for win so layout and whatnot will be the same */
 typedef struct {

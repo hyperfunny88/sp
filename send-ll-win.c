@@ -6,11 +6,6 @@
 #include <fcntl.h>
 #include <psapi.h>
 
-#ifndef SP_DEBUG
-#	undef DEBUG
-#	define DEBUG(...)
-#endif
-
 #define FNCOM(t, fn) static typeof(((t*)NULL)->lpVtbl->fn) o_##fn
 #define TRY(x, gt) if (!(x)) goto gt
 #define TRYH(hr, gt) TRY(SUCCEEDED(hr), gt)
@@ -35,6 +30,8 @@ typedef struct {
 	IAudioStreamVolume *asvs[MAX_CLIENTS];
 	V vs[MAX_CLIENTS];
 	SRWLOCK srw;
+	char name[MAX_NAME];
+	u32 namesz;
 } S;
 
 static S *s = NULL, sstore;
@@ -44,15 +41,18 @@ static volatile enum {
 	LOAD_DISABLE,
 	LOAD_OK
 } loadstate = LOAD_WAIT;
-static HANDLE loadevt = NULL;
+
+static HANDLE loadevt = NULL,
+	      pipe = NULL;
 
 typedef struct {
-	HANDLE pipe;
-	u32 ip;
+	char namebuf[MAX_PATH], *name;
+	u32 namesz, ip;
 	u16 port;
-} PrgCfg;
+} Prg;
 
-static PrgCfg pcfg;
+static Prg prg;
+
 #ifdef SP_DEBUG
 static volatile bool conready = false;
 #endif
@@ -108,37 +108,38 @@ ret:
 	return r;
 }
 
-static bool sendbuf(const void *buf, u32 sz)
+static bool sendbuf(V *v, Cmd cmd, const void *buf, u32 sz)
 {
 	if (!s->sfd)
 		return false;
 	struct sockaddr_in sinv = {
 		.sin_family = AF_INET,
-		.sin_port = htons(pcfg.port),
-		.sin_addr.s_addr = pcfg.ip
+		.sin_port = htons(prg.port),
+		.sin_addr.s_addr = prg.ip
 	};
-	int sent = sendto(s->sfd, buf, (int)sz, 0, (struct sockaddr*)&sinv,
-			  sizeof(sinv));
+	u8 bufv[BUF_SZ], *b = bufv;
+	enchdr(b, (Hdr){v->cfg, cmd});
+	b += HDR_SZ;
+	memcpy(b, s->name, s->namesz + 1);
+	b += s->namesz + 1;
+	memcpy(b, buf, sz);
+	b += sz;
+	u32 tosend = (u32)(b - bufv);
+	int sent = sendto(s->sfd, (const char*)bufv, (int)tosend, 0,
+			  (struct sockaddr*)&sinv, sizeof(sinv));
 	if ((u32)sent < sz) {
-		WARN("sent (%i) < to send (%u)", sent, sz);
+		DEBUG("sent (%i) < to send (%u)", sent, sz);
 		return false;
 	}
 	return true;
 }
 
-static void sendcmdnolock(V *v, u8 cmd, const void *buf, u32 sz)
-{
-	u8 b[BUF_SZ];
-	enchdr(b, (Hdr){v->cfg, cmd});
-	memcpy(b + HDR_SZ, buf, sz);
-	sendbuf(b, HDR_SZ + sz);
-}
-
-static void sendcmd(V *v, u8 cmd, const void *buf, u32 sz)
+static bool sendlocked(V *v, u8 cmd, const void *buf, u32 sz)
 {
 	AcquireSRWLockExclusive(&s->srw);
-	sendcmdnolock(v, cmd, buf, sz);
+	bool r = sendbuf(v, cmd, buf, sz);
 	ReleaseSRWLockExclusive(&s->srw);
+	return r;
 }
 
 FNCOM(IAudioRenderClient, ReleaseBuffer);
@@ -159,18 +160,12 @@ static HRESULT HOOKCALL h_ReleaseBuffer(IAudioRenderClient *rc,
 		DEBUG("bad: %u > %u", sz, BUF_SZ / 2);
 		goto ret;
 	}
-	u8 buf[BUF_SZ], *b = buf + HDR_SZ;
+	bool sent;
 	if (flags & AUDCLNT_BUFFERFLAGS_SILENT)
-		memset(b, 0, sz);
+		sent = sendlocked(v, CMD_SILENT, &sz, sizeof(sz));
 	else
-		memcpy(b, v->buf, sz);
+		sent = sendlocked(v, CMD_NONE, v->buf, sz);
 	v->buf = NULL;
-	enchdr(buf, (Hdr){v->cfg, CMD_NONE});
-	/* it used to be ReleaseBuffer -> ringbuf -> send (in another thread),
-	 * but I don't think the windows scheduler likes that when it's under
-	 * load, so sending the data directly in the hooks; might not be great
-	 * if sendto decides to block */
-	bool sent = sendbuf(buf, HDR_SZ + sz);
 	u64 t = ns();
 	if (sent && v->cnt % 200 == 0) {
 		DEBUG("send (%u): %u bytes - %u us", v->cnt, sz,
@@ -192,7 +187,7 @@ static ULONG HOOKCALL h_Release(IAudioRenderClient *rc)
 		s->cs[idx] = s->cs[last];
 		s->rcs[idx] = s->rcs[last];
 		s->vs[idx] = s->vs[last];
-		sendcmdnolock(v, CMD_RM, NULL, 0);
+		sendbuf(v, CMD_RM, NULL, 0);
 		ReleaseSRWLockExclusive(&s->srw);
 	}
 	return o_Release(rc);
@@ -227,7 +222,7 @@ static HRESULT HOOKCALL h_Reset(IAudioClient *c)
 {
 	V *v = vfromc(c);
 	if (v)
-		sendcmd(v, CMD_RESET, NULL, 0);
+		sendlocked(v, CMD_RESET, NULL, 0);
 	return o_Reset(c);
 }
 
@@ -237,7 +232,7 @@ static HRESULT HOOKCALL h_Start(IAudioClient *c)
 	DEBUG("start");
 	V *v = vfromc(c);
 	if (v)
-		sendcmd(v, CMD_START, NULL, 0);
+		sendlocked(v, CMD_START, NULL, 0);
 	return o_Start(c);
 }
 
@@ -247,7 +242,7 @@ static HRESULT HOOKCALL h_Stop(IAudioClient *c)
 	DEBUG("stop");
 	V *v = vfromc(c);
 	if (v)
-		sendcmd(v, CMD_PAUSE, NULL, 0);
+		sendlocked(v, CMD_PAUSE, NULL, 0);
 	return o_Stop(c);
 }
 
@@ -263,7 +258,7 @@ static HRESULT HOOKCALL h_SetMasterVolume(ISimpleAudioVolume *sav, float fLevel,
 	f32 vols[MAX_CHANNELS];
 	for (u32 i = 0; i < n; ++i)
 		vols[i] = (v->mastervol = fLevel) * v->streamvols[i];
-	sendcmd(v, CMD_VOL, vols, sizeof(*vols) * n);
+	sendlocked(v, CMD_VOL, vols, sizeof(*vols) * n);
 	return hr;
 }
 
@@ -283,7 +278,7 @@ static HRESULT HOOKCALL h_SetMute(ISimpleAudioVolume *sav, const BOOL bMute,
 		vols[i] = (v->mastervol = bMute ? 0.0f : 1.0f)
 			* v->streamvols[i];
 	}
-	sendcmd(v, CMD_VOL, vols, sizeof(*vols) * n);
+	sendlocked(v, CMD_VOL, vols, sizeof(*vols) * n);
 	return hr;
 }
 
@@ -302,7 +297,7 @@ static HRESULT HOOKCALL h_SetChannelVolume(
 	f32 vols[MAX_CHANNELS];
 	for (u32 i = 0; i < n; ++i)
 		vols[i] = v->streamvols[i]  * v->mastervol;
-	sendcmd(v, CMD_VOL, vols, sizeof(*vols) * n);
+	sendlocked(v, CMD_VOL, vols, sizeof(*vols) * n);
 	return hr;
 }
 
@@ -320,7 +315,7 @@ static HRESULT HOOKCALL h_SetAllVolumes(
 	f32 vols[MAX_CHANNELS];
 	for (u32 i = 0; i < n; ++i)
 		vols[i] = (v->streamvols[i] = pfVolumes[i]) * v->mastervol;
-	sendcmd(v, CMD_VOL, vols, sizeof(*vols) * n);
+	sendlocked(v, CMD_VOL, vols, sizeof(*vols) * n);
 	return hr;
 }
 
@@ -329,6 +324,13 @@ static void makesock(void)
 	WSADATA ws;
 	CHK(WSAStartup(MAKEWORD(2, 2), &ws) == 0, "init winsock2");
 	s->sfd = socket(AF_INET, SOCK_DGRAM, 0);
+	char hostname[MAX_NAME];
+	*hostname = '\0';
+	if (gethostname(hostname, MAX_NAME - 1) == 0) {
+		int n = snprintf(s->name, MAX_NAME - 1, "%s/%s", hostname,
+				 prg.name);
+		s->namesz = MIN(MAX_NAME - 1, (u32)n);
+	}
 }
 
 static void make(void)
@@ -338,7 +340,9 @@ static void make(void)
 		.cs = {0},
 		.rcs = {0},
 		.vs = {0},
-		.srw = SRWLOCK_INIT
+		.srw = SRWLOCK_INIT,
+		.name = {0},
+		.namesz = 0
 	};
 	makesock();
 }
@@ -416,8 +420,8 @@ static DWORD WINAPI makedbg(void)
 {
 	makecon();
 	DEBUG("sp (send | low-latency | win)");
-	struct in_addr ia = {.S_un.S_addr = pcfg.ip};
-	DEBUG("sending to %s:%u", inet_ntoa(ia), pcfg.port);
+	struct in_addr ia = {.S_un.S_addr = prg.ip};
+	DEBUG("sending to %s:%u", inet_ntoa(ia), prg.port);
 	if (s->n)
 		logv(&s->vs[0]);
 	return 0;
@@ -481,7 +485,7 @@ gskip:;
 		for (u32 i = 0; i < MAX_CHANNELS; ++i)
 			v.streamvols[i] = 1.0f;
 		v.mastervol = 1.0f;
-		sendcmdnolock(&v, CMD_PREP, NULL, 0);
+		sendbuf(&v, CMD_PREP, NULL, 0);
 	}
 	HRESULT hr = o_Initialize(c, ShareMode, StreamFlags, hnsBufferDuration,
 				  hnsPeriodicity, pFormat, AudioSessionGuid);
@@ -499,6 +503,11 @@ gskip:;
 	}
 	UINT32 bufsz;
 	F(c, GetBufferSize, &bufsz);
+	u32 fsz = framesz(cfg);
+	if (bufsz * fsz > BUF_SZ * 9 / 10) {
+		DEBUG("buffer required too big for reciever");
+		goto ret;
+	}
 	v.cfg.bufsz = bufsz;
 	fd_set fds;
 	FD_ZERO(&fds);
@@ -529,34 +538,36 @@ ret:
 	sprintf(msgbuf, s, ##__VA_ARGS__); \
 	MessageBoxA(NULL, msgbuf, "", MB_OK); } while (0)
 
-static bool reqpipe(u64 *sentms)
+static bool reqpipe(OVERLAPPED *wop, u64 *sentms)
 {
 	bool ok = false;
-	pcfg.pipe = CreateFileW(PIPE_NAME, GENERIC_READ | FILE_APPEND_DATA,
+	pipe = CreateFileW(PIPE_NAME, GENERIC_READ | GENERIC_WRITE,
 				FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
 				OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-	TRY(pcfg.pipe != INVALID_HANDLE_VALUE, eopen);
+	TRY(pipe != INVALID_HANDLE_VALUE, ret);
+	_Static_assert(PIPE_BUF_SZ > sizeof(prg.namebuf), "");
+	TRY(WriteFile(pipe, prg.name, prg.namesz, NULL, wop), ret);
 	*sentms = ms();
 	ok = true;
-eopen:
+ret:
 	return ok;
 }
 
 static bool handlepipereply(u64 sentms)
 {
 	LlInfo info;
-	OVERLAPPED op = {0};
-	BOOL r = ReadFile(pcfg.pipe, &info, sizeof(info), NULL, &op);
+	OVERLAPPED rop = {0};
+	BOOL r = ReadFile(pipe, &info, sizeof(info), NULL, &rop);
 	if (!r && GetLastError() != ERROR_IO_PENDING)
 		return false;
 	DWORD read;
-	u64 kwaitms = 10, to = sentms + kwaitms, t = ms(),
+	u64 waitms = 10, to = sentms + waitms, t = ms(),
 	    wait = to - MIN(t, to);
-	r = GetOverlappedResultEx(pcfg.pipe, &op, &read, (DWORD)wait, FALSE);
+	r = GetOverlappedResultEx(pipe, &rop, &read, (DWORD)wait, FALSE);
 	if (!r || read != sizeof(info))
 		return false;
-	pcfg.ip = info.ip;
-	pcfg.port = info.port;
+	prg.ip = info.ip;
+	prg.port = info.port;
 	return !info.disable;
 }
 
@@ -564,21 +575,37 @@ static DWORD WINAPI loadpcfg(LPVOID p)
 {
 	(void)p;
 	u64 sentms;
-	bool r = reqpipe(&sentms);
+	OVERLAPPED wop = {0};
+	bool r = reqpipe(&wop, &sentms);
 	TRY(r, rej);
-	wchar_t filename[MAX_PATH] = {0};
-	GetModuleFileNameExW(GetCurrentProcess(), GetModuleHandleW(NULL),
-			     filename, MAX_PATH);
-	if (wcsstr(filename, L"sp-"))
+	if (strstr(prg.name, "sp-"))
 		goto rej;
 	r = handlepipereply(sentms);
 	TRY(r, rej);
 	loadstate = LOAD_OK;
 	SetEvent(loadevt);
 rej:
-	if (pcfg.pipe != INVALID_HANDLE_VALUE)
-		CloseHandle(pcfg.pipe);
+	if (pipe != INVALID_HANDLE_VALUE)
+		CloseHandle(pipe);
 	return 0;
+}
+
+static void getprgname(void)
+{
+	prg.namesz = GetModuleFileNameA(NULL, prg.namebuf, MAX_PATH);
+	if (!prg.namesz)
+		return;
+	u32 lastslash = 0, at = 0;
+	for (char *c = prg.namebuf; *c; ++c, ++at)
+		lastslash = *c == '\\' ? at : lastslash;
+	prg.name = prg.namebuf + lastslash + 1;
+	prg.namesz -= lastslash + 1;
+	for (char *c = prg.name + prg.namesz - 1; c != prg.name; --c) {
+		if (*c == '.') {
+			*c = '\0';
+			break;
+		}
+	}
 }
 
 static DWORD WINAPI dllmain(void *p)
@@ -589,6 +616,7 @@ static DWORD WINAPI dllmain(void *p)
 	/* doing all of this thread stuff because we need to hook Initialize
 	 * fast before the program calls it */
 	HANDLE th = CreateThread(NULL, 0, loadpcfg, NULL, 0, NULL);
+	getprgname();
 	CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	MH_Initialize();
 	HRESULT hr;
