@@ -100,7 +100,7 @@ For a quick build, there are some scripts included. Simply run `./build/unix &&
 sp is targeted towards VM communication, and is not optimized to be used over a
 physical network. The way that sp sends data is likely unfriendly to most
 routers and network cards. As mentioned earlier, sp does not do any extra
-buffering, batching, or processing or buffering at the sender's side. Therefore
+buffering, batching, or processing at the sender's side. Therefore
 if you are using `sp-send-ll`, every hooked program will create it's own
 	connection to send the stream. This means that with `sp-send-ll`, the
 	more clients you have, the more bandwidth it uses.
