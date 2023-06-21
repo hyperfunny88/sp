@@ -370,6 +370,8 @@ static void help(const char *argv)
 
 int main(int argc, char *argv[])
 {
+	if (argc >= 3)
+		respawner(argc, argv, 3);
 	setupcon();
 	INFO("sp (send | win)");
 	if (argc < 3)

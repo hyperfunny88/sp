@@ -35,7 +35,8 @@ struct Inst {
 typedef enum {
 	PLAY_WAIT,
 	PLAY_PLAY,
-	PLAY_PAUSE
+	PLAY_PAUSE,
+	PLAY_TMP_PAUSE
 } PlayState;
 
 typedef struct {
@@ -112,7 +113,7 @@ static u32 play(S *s, u32 nframes, u32 avgframes, void *out, bool fill)
 		if (s->pauseheur < 2000)
 			WARN("[%s]: underrun (%u)", s->name, ++s->underrun);
 		else
-			s->ps = PLAY_PAUSE;
+			s->ps = PLAY_TMP_PAUSE;
 		s->pauseheur += 100;
 	} else if (read > need) {
 		read = need;
@@ -126,7 +127,7 @@ static u32 play(S *s, u32 nframes, u32 avgframes, void *out, bool fill)
 
 static f32 kcvt(u32 bits)
 {
-	return 1.0f / (f32)((1u << (bits - 1)));
+	return 1.0f / (f32)(1u << (bits - 1));
 }
 
 /* maybe support big-endian properly ? */
@@ -301,7 +302,7 @@ static bool sioplayonce(S *s, SioParam *p, struct SoundIoOutStream *os, i32 rem,
 		case 4: siowrite(s, ar, buf, nfr, mch, nch, 4, s32tof32); break;
 		case 3: siowrite(s, ar, buf, nfr, mch, nch, 3, s24tof32); break;
 		case 2: siowrite(s, ar, buf, nfr, mch, nch, 2, s16tof32); break;
-		default: DIE("unsupported bit depth");
+		default: ASSERT(false);
 		}
 	}
 	err = soundio_outstream_end_write(os);
@@ -1173,8 +1174,10 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 			     "clients");
 			return;
 		}
-		if (!*avail)
+		if (!*avail) {
 			*avail = *recycle;
+			*recycle = 0;
+		}
 		idx = (u32)__builtin_ctz(*avail);
 		u32 bit = 1u << idx;
 		*avail ^= bit;
@@ -1271,7 +1274,7 @@ static void handle(Inst *inst, Socket sfd, S *ss, u64 *lastt, u32 *n,
 		if (writable < bsz)
 			ringbuf_reset(rb);
 		ringbuf_write(rb, b, bsz);
-		if (!s->rs && s->ps == PLAY_WAIT)
+		if (!s->rs && (s->ps == PLAY_WAIT || s->ps == PLAY_TMP_PAUSE))
 			s->ps = PLAY_PLAY;
 	}
 unlock:
@@ -1362,10 +1365,10 @@ static void help(const char *argv)
 	     	"-s\tmin drop slack (ms) = 0 (auto)\n\t"
 #ifdef USE_RESAMPLE
 	     	"-r\tresampler quality (1 (lowest) - 10 (highest), only for "
-		"libsoundio and WASAPI) = 9\n\t";
+		"libsoundio and WASAPI) = 9\n\t"
 #else
-	;
 #endif
+		"-R (automatically respawn process on death)";
 	INFO("usage: %s <port> [options...]\n%s", argv, s);
 }
 
@@ -1375,6 +1378,8 @@ static void help(const char *argv)
 
 int main(int argc, char *argv[])
 {
+	if (argc >= 2)
+		respawner(argc, argv, 2);
 	INFO("sp (recv)");
 	if (argc < 2)
 		HELP();
@@ -1398,7 +1403,9 @@ int main(int argc, char *argv[])
 	enum SoundIoBackend sioback = SoundIoBackendNone;
 #endif
 	for (int i = 2; i < argc; ++i) {
-		if (*argv[i] != '-')
+		if (*argv[i] == '~')
+			continue;
+		else if (*argv[i] != '-')
 			HELP();
 		switch (argv[i][1]) {
 		case 'q':

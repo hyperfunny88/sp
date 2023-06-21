@@ -19,6 +19,7 @@
 
 #ifdef __unix__
 #	include <unistd.h>
+#	include <wait.h>
 #	include <netdb.h>
 #	include <sys/socket.h>
 #	include <sys/types.h>
@@ -77,7 +78,7 @@ typedef double f64;
 #define LIKELY(x) __builtin_expect((x), 1);
 #define UNLIKELY(x) __builtin_expect((x), 0)
 #ifndef NDEBUG
-#	define ASSERT(x) assert(x)
+#	define ASSERT(x) if (!(x)) DIE("assert failed");
 #else
 #	define ASSERT(x) (void)(x)
 #endif
@@ -254,6 +255,27 @@ inline static u64 mix(u64 x)
 inline static u32 rndid(void)
 {
 	return (u32)mix(ns());
+}
+
+inline static void respawner(int argc, char *argv[], int startarg)
+{
+	for (int i = startarg; i < argc; ++i) {
+		if (argv[i][0] == '~')
+			return;
+		else if (argv[i][0] != '-' || argv[i][1] != 'R')
+			continue;
+		*argv[i] = '~';
+		INFO("respawning process on death");
+#ifdef __unix__
+		while (fork() > 0) {
+			wait(&(int){0});
+			WARN("respawn");
+		}
+#elif _WIN32
+		while (_spawnv(_P_WAIT, argv[0], (const char**)argv) >= 0)
+			WARN("respawn");
+#endif
+	}
 }
 
 #ifdef __unix__
