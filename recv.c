@@ -811,7 +811,7 @@ static void wasmake(Inst *inst, S *s)
 	hr = F(g->dev, Activate, &IID_IAudioClient3, CLSCTX_ALL, NULL,
 	       (void**)&p->c);
 	WAVEFORMATEXTENSIBLE wf = makewavefmt(s->cfg);
-	WAVEFORMATEX *mwf = NULL;
+	WAVEFORMATEX *mwf;
 	F(p->c, GetMixFormat, &mwf);
 	bool sup = (mwf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
 		    (mwf->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&

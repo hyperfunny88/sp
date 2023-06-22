@@ -64,7 +64,11 @@ typedef double f64;
 #	define LOGFILE stderr
 #	define DEBUG(s, ...) COLOR("34", "debug", "   ", s, ##__VA_ARGS__)
 #else
-#	define LOGFILE stdout
+#	ifdef _WIN32
+#		define LOGFILE stderr
+#	else
+#		define LOGFILE stdout
+#	endif
 #	define DEBUG(...)
 #endif
 #define ABORT() exit(1)
