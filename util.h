@@ -81,7 +81,8 @@ typedef double f64;
 	else COLOR("32", "ok", "      ", s, ##__VA_ARGS__); } while (0)
 #define LIKELY(x) __builtin_expect((x), 1);
 #define UNLIKELY(x) __builtin_expect((x), 0)
-#define ASSERT(x) if (!(x)) DIE("assert failed");
+#define ASSERT(x) do { if (!(x)) DIE("assert failed"); } while (0)
+#define UNUSED __attribute__((unused))
 
 typedef enum {
 	CMD_NONE = 0,

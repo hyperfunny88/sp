@@ -131,7 +131,7 @@ static f32 kcvt(u32 bits)
 }
 
 /* maybe support big-endian properly ? */
-static f32 loadf32(void *p) { return *(f32*)p; }
+UNUSED static f32 loadf32(void *p) { return *(f32*)p; }
 static f32 s16tof32(void *p) { return (f32)*(i16*)p * kcvt(16); }
 static f32 s32tof32(void *p) { return (f32)*(i32*)p * kcvt(32); }
 static f32 s24tof32(void *p)
@@ -142,7 +142,7 @@ static f32 s24tof32(void *p)
 	return (f32)v * kcvt(24);
 }
 
-static void bitcvt(f32 *out, u8 *in, u32 bsz, u32 bytedepth)
+UNUSED static void bitcvt(f32 *out, u8 *in, u32 bsz, u32 bytedepth)
 {
 	f32 (*fnt[])(void*) = {s16tof32, s24tof32, s32tof32},
 	    (*load)(void*) = fnt[bytedepth - 2];
@@ -765,7 +765,6 @@ static bool wasplayonce(S *s, WasParam *p)
 	memcpy(frames, f, ofsz * nframes);
 	F(p->rc, ReleaseBuffer, nframes, 0);
 	ReleaseSRWLockExclusive(&p->srw);
-	(void)loadf32; /* unused */
 	return true;
 }
 
