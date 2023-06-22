@@ -289,7 +289,6 @@ static void loadblacklist(S *s, const char *blacklist)
 			break;
 		if (!*trimws(buf))
 			continue;
-		INFO("%s, %u", buf, (u32)strlen(buf));
 		u32 h = (u32)mix(strhash(buf)), p = h % MAX_BLACKLIST;
 		for (; s->blacklist[p]; ++p);
 		s->blacklist[p] = h;
