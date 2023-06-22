@@ -1342,7 +1342,7 @@ static void run(u16 port, Inst *inst, u32 slack, bool quiet)
 			INFO("[%s]: timeout", ss[idx].name);
 			rm(&ss[idx], &sl, &taken, &recycle, &n);
 		}
-		t = nextto;
+		nextto = t;
 	}
 	if (r < 0)
 		DIE("select");
