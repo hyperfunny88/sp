@@ -3,6 +3,8 @@
 
 #include "util.h"
 
+enum {MAX_BLACKLIST = 512, MAX_BLACKLIST_LOAD = MAX_BLACKLIST * 2/3};
+
 typedef struct {
 	IMMDeviceEnumerator *devenum;
 	IMMDevice *dev;
@@ -13,6 +15,7 @@ typedef struct {
 	Cfg cfg;
 	HANDLE evt, silevt;
 	Socket sfd;
+	u32 blacklist[MAX_BLACKLIST];
 	u32 ip, evtto, namesz, silbufsz, silto;
 	u16 port;
 } S;
@@ -143,6 +146,12 @@ typedef struct {
 	u8 ps;
 } Client;
 
+static char *trimws(char *s)
+{
+	for (char *p = s + strlen(s) - 1; isspace(*p); *p-- = '\0');
+	return s;
+}
+
 static bool servepipe(S *s, Client *c, u32 idx)
 {
 	(void)idx;
@@ -167,17 +176,34 @@ static bool servepipe(S *s, Client *c, u32 idx)
 			WARN(PREP_READ_MSG);
 			return false;
 		}
+		char *name = (char*)c->buf;
+		name[PIPE_BUF_SZ - 1] = '\0';
+		if (!*trimws(name)) {
+			WARN("invalid low-latency hook name");
+			return false;
+		}
+		/* hash-table search; should help when large number of entries
+		 * in blacklist */
+		u32 h = (u32)mix(strhash(name)), p = h % MAX_BLACKLIST;
+		bool disable = false;
+		for (; s->blacklist[p] && !(disable = (s->blacklist[p] == h));
+		     ++p);
 		LlInfo info = {
 			.ip = s->ip,
 			.port = s->port,
-			.disable = false
+			.disable = disable
 		};
 		if (!WriteFile(c->pipe, &info, sizeof(info), NULL, c->op)){
-			WARN("failed to send reply back to low-latency client");
+			WARN("failed to send reply back to low-latency hook");
 			return false;
 		}
 		c->ps = PIPESTATE_PREP_WRITE;
-		INFO("new low-latency client: %s", (char*)c->buf);
+		if (!disable)
+			INFO("new low-latency hooked program: %s", name);
+		else {
+			INFO("blacklisted low-latency hooked program disabled: "
+			     "%s", name);
+		}
 	} }
 	return true;
 }
@@ -251,9 +277,34 @@ static DWORD WINAPI pipeproc(LPVOID p)
 	}
 }
 
-static void make(S *s, u32 ip, u16 port)
+static void loadblacklist(S *s, const char *blacklist)
+{
+	FILE *f = fopen(blacklist, "r");
+	if (!f)
+		DIE("error loading blacklist file");
+	u32 n = 0;
+	while (n < MAX_BLACKLIST_LOAD) {
+		char buf[1024];
+		if (!fgets(buf, sizeof(buf), f))
+			break;
+		if (!*trimws(buf))
+			continue;
+		INFO("%s, %u", buf, (u32)strlen(buf));
+		u32 h = (u32)mix(strhash(buf)), p = h % MAX_BLACKLIST;
+		for (; s->blacklist[p]; ++p);
+		s->blacklist[p] = h;
+		++n;
+	}
+	if (n == MAX_BLACKLIST_LOAD)
+		WARN("too many entries in blacklist");
+	fclose(f);
+	INFO("loaded %u entries into blacklist", n);
+}
+
+static void make(S *s, u32 ip, u16 port, const char *blacklist)
 {
 	*s = (S){
+		.blacklist = {0},
 		.ip = ip,
 		.port = port,
 		.name = {0},
@@ -265,6 +316,8 @@ static void make(S *s, u32 ip, u16 port)
 	gethostname(hostname, MAX_NAME - 1);
 	int n = snprintf(s->name, MAX_NAME - 1, "%s/sp-send", hostname);
 	s->namesz = MIN((u32)n, MAX_NAME - 1);
+	if (blacklist)
+		loadblacklist(s, blacklist);
 	CreateThread(NULL, 0, pipeproc, s, 0, NULL);
 }
 
@@ -424,7 +477,9 @@ static void help(const char *argv)
 {
 	const char *s =
 		"options:\n\t"
-		"-m (mute, only use as connector with sp-send-ll)";
+		"-m\t(mute, only use as connector with sp-send-ll)\n\t"
+		"-b\tblacklist file for sp-send-ll (line separated, without "
+		".exe extension)";
 	INFO("usage: %s <ip> <port> [options...]\n%s", argv, s);
 }
 
@@ -441,13 +496,23 @@ int main(int argc, char *argv[])
 	if (argc < 3)
 		HELP();
 	bool mute = false;
-	if (argc == 4) {
-		if (argv[3][0] == '-' && argv[3][1] == 'm')
+	const char *blacklist = NULL;
+	for (int i = 3; i < argc; ++i) {
+		if (*argv[i] == '~')
+			continue;
+		else if (*argv[i] != '-')
+			HELP();
+		if (argv[i][1] == 'm')
 			mute = true;
+		else if (argv[i][1] == 'b' && i + 1 < argc)
+			blacklist = argv[++i];
+		else
+			HELP();
 	}
 	char *end;
 	S s;
-	make(&s, inet_addr(argv[1]), (u16)strtol(argv[2], &end, 10));
+	make(&s, inet_addr(argv[1]), (u16)strtol(argv[2], &end, 10),
+	     blacklist);
 	if (!mute) {
 		makecapture(&s);
 		makesilent(&s);

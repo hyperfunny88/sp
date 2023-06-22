@@ -242,6 +242,17 @@ inline static u64 ms(void)
 	return ns() / 1000000;
 }
 
+inline static u32 strhash(const char *s)
+{
+	/* adler32 */
+	u32 a = 1, b = 0;
+	for (; *s; ++s) {
+		a = (a + (u32)*s) % 65521;
+		b = (b + a) % 65521;
+	}
+	return b << 16 | a;
+}
+
 inline static u64 mix(u64 x)
 {
 	const u64 C = UINT64_C(0xBEA225F9EB34556D);

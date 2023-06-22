@@ -225,17 +225,6 @@ static void makers(S *s, Inst *inst, u32 outrate)
 }
 #endif
 
-static u32 strhash(const char *s)
-{
-	/* adler32 */
-	u32 a = 1, b = 0;
-	for (; *s; ++s) {
-		a = (a + (u32)*s) % 65521;
-		b = (b + a) % 65521;
-	}
-	return b << 16 | a;
-}
-
 /* libsoundio { */
 #ifdef SP_SIO
 typedef struct {
