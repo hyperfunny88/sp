@@ -302,7 +302,7 @@ static bool sioplayonce(S *s, SioParam *p, struct SoundIoOutStream *os, i32 rem,
 		case 4: siowrite(s, ar, buf, nfr, mch, nch, 4, s32tof32); break;
 		case 3: siowrite(s, ar, buf, nfr, mch, nch, 3, s24tof32); break;
 		case 2: siowrite(s, ar, buf, nfr, mch, nch, 2, s16tof32); break;
-		default: ASSERT(false);
+		default: ASSERT(false); /* shouldn't ever happen */
 		}
 	}
 	err = soundio_outstream_end_write(os);
@@ -813,9 +813,12 @@ static void wasmake(Inst *inst, S *s)
 	WAVEFORMATEXTENSIBLE wf = makewavefmt(s->cfg);
 	WAVEFORMATEX *mwf;
 	F(p->c, GetMixFormat, &mwf);
-	ASSERT(mwf->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-	       IsEqualGUID(&((WAVEFORMATEXTENSIBLE*)mwf)->SubFormat,
-			   &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+	bool sup = (mwf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+		    (mwf->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+		     IsEqualGUID(&((WAVEFORMATEXTENSIBLE*)mwf)->SubFormat,
+				 &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)));
+	if (!sup)
+		DIE("unsupported mix format");
 	if (s->cfg.rate != mwf->nSamplesPerSec) {
 		makers(s, inst, mwf->nSamplesPerSec);
 		wf = makewavefmt(s->cfg);
@@ -1385,7 +1388,8 @@ int main(int argc, char *argv[])
 		HELP();
 	char *end;
 	u32 port = (u32)strtoul(argv[1], &end, 10);
-	ASSERT(port > 0 && port < 0xFFFF);
+	if (port == 0 || port >= 0xFFFF)
+		DIE("invalid port");
 	u32 devhash = 0, slack = 0, rsqual = 9;
 	bool quiet = false, listdev = false;
 	enum {
@@ -1448,7 +1452,8 @@ int main(int argc, char *argv[])
 			if (++i >= argc)
 				HELP();
 			rsqual = (u32)strtoul(argv[i], &end, 10);
-			ASSERT(rsqual >= 1 && rsqual <= 10);
+			if (rsqual > 10)
+				HELP();
 			break;
 #endif
 		case 'h':
