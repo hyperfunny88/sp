@@ -77,7 +77,7 @@ static void makeclient(S *s)
 	hr = F(s->client, GetDevicePeriod, &def, &min);
 	CHKH(hr, "get device period");
 	s->evtto = (u32)(min / 1000);
-	WAVEFORMATEX *wf;
+	WAVEFORMATEX *wf = NULL;
 	hr = F(s->client, GetMixFormat, &wf);
 	CHKH(hr, "get mix format");
 	hr = F(s->client, Initialize, AUDCLNT_SHAREMODE_SHARED,

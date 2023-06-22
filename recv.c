@@ -497,8 +497,8 @@ static void pwproc(void *userdata)
 		sb->datas[i].chunk->size = nframes * sizeof(f32);
 	}
 	u8 buf[BUF_SZ];
-	u32 read = play(p->s, nframes, nframes, buf, true);
-	pwcvt(p->s, dsts, buf, read, p->s->cfg);
+	play(p->s, nframes, nframes, buf, true);
+	pwcvt(p->s, dsts, buf, nframes * ofsz, p->s->cfg);
 	pw_stream_queue_buffer(p->stream, pb);
 }
 
@@ -811,7 +811,7 @@ static void wasmake(Inst *inst, S *s)
 	hr = F(g->dev, Activate, &IID_IAudioClient3, CLSCTX_ALL, NULL,
 	       (void**)&p->c);
 	WAVEFORMATEXTENSIBLE wf = makewavefmt(s->cfg);
-	WAVEFORMATEX *mwf;
+	WAVEFORMATEX *mwf = NULL;
 	F(p->c, GetMixFormat, &mwf);
 	bool sup = (mwf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
 		    (mwf->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
