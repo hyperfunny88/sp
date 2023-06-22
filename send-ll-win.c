@@ -561,7 +561,7 @@ static bool handlepipereply(u64 sentms)
 	if (!r && GetLastError() != ERROR_IO_PENDING)
 		return false;
 	DWORD read;
-	u64 waitms = 10, to = sentms + waitms, t = ms(),
+	u64 waitms = 30, to = sentms + waitms, t = ms(),
 	    wait = to - MIN(t, to);
 	r = GetOverlappedResultEx(pipe, &rop, &read, (DWORD)wait, FALSE);
 	if (!r || read != sizeof(info))
