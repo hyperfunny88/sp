@@ -1316,10 +1316,10 @@ static void run(u16 port, Inst *inst, u32 slack, bool quiet)
 	_Static_assert(MAX_CLIENT <= 32, "");
 	fd_set fdsv;
 	int r;
-	const u32 timeouts = 60, timeoutms = timeouts * 1000;
+	const u32 timeouts = 30, timeoutms = timeouts * 1000;
 	u64 nextto = ms() + timeoutms, t;
 	struct timeval tv;
-	for (; true; nextto = t + timeoutms) {
+	while (true) {
 		t = ms();
 		tv.tv_sec = (i64)((nextto - MIN(t, nextto)) / 1000);
 		tv.tv_usec = 0;
@@ -1337,11 +1337,12 @@ static void run(u16 port, Inst *inst, u32 slack, bool quiet)
 		u32 idxs = taken;
 		for (u32 idx; idxs; idxs ^= 1 << idx) {
 			idx = (u32)__builtin_ctz(idxs);
-			if (t < lastt[idx] + timeoutms) 
+			if (lastt[idx] && t < lastt[idx] + timeoutms) 
 				continue;
 			INFO("[%s]: timeout", ss[idx].name);
 			rm(&ss[idx], &sl, &taken, &recycle, &n);
 		}
+		t = nextto;
 	}
 	if (r < 0)
 		DIE("select");
