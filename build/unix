@@ -2,8 +2,8 @@
 use_soundio=1
 use_pipewire=1
 
-flags="-Os -flto -Wall -Wextra -DSP_SIO -DSP_PW -I . $CFLAGS"
-ldflags="-L /usr/local/lib -flto -s -lspeexdsp -lsoundio $LDFLAGS"
+flags="-Os -g -flto -Wall -Wextra -DSP_SIO -DSP_PW -I . $CFLAGS"
+ldflags="-L /usr/local/lib -lspeexdsp -lsoundio $LDFLAGS"
 
 flags="$flags $ldflags"
 
