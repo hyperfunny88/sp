@@ -267,7 +267,7 @@ inline static void respawner(int argc, char *argv[], int startarg)
 			wait(&(int){0});
 			WARN("respawn");
 		}
-#elif _WIN32
+#elif defined(_WIN32)
 		while (_spawnv(_P_WAIT, argv[0], (const char**)argv) >= 0)
 			WARN("respawn");
 #endif

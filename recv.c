@@ -1430,9 +1430,9 @@ int main(int argc, char *argv[])
 				sioback = SoundIoBackendJack;
 			else if (strcmp(argv[i], "pulse") == 0)
 				sioback = SoundIoBackendPulseAudio;
+#endif
 			else
 				HELP();
-#endif
 			break;
 		case 'd':
 			if (++i >= argc)
