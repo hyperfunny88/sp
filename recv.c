@@ -1371,7 +1371,7 @@ static void help(const char *argv)
 		"libsoundio and WASAPI) = 9\n\t"
 #else
 #endif
-		"-R (automatically respawn process on death)";
+		"-R\t(automatically respawn process on death)";
 	INFO("usage: %s <port> [options...]\n%s", argv, s);
 }
 
