@@ -6,13 +6,14 @@
 typedef struct {
 	IMMDeviceEnumerator *devenum;
 	IMMDevice *dev;
-	IAudioClient *client;
+	IAudioClient *client, *silc;
 	IAudioCaptureClient *capt;
+	IAudioRenderClient *silrc;
 	char name[MAX_NAME];
 	Cfg cfg;
-	HANDLE evt;
+	HANDLE evt, silevt;
 	Socket sfd;
-	u32 ip, evtto, namesz;
+	u32 ip, evtto, namesz, silbufsz, silto;
 	u16 port;
 } S;
 
@@ -71,7 +72,7 @@ static void makeclient(S *s)
 	HRESULT hr;
 	hr = F(s->dev, Activate, &IID_IAudioClient, CLSCTX_ALL, NULL,
 	       (void**)&s->client);
-	CHKH(hr, "make audio client");
+	CHKH(hr, "get audio client");
 	REFERENCE_TIME def, min;
 	hr = F(s->client, GetDevicePeriod, &def, &min);
 	CHKH(hr, "get device period");
@@ -283,6 +284,69 @@ static void makecapture(S *s)
 	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 }
 
+static void makesilent(S *s)
+{
+	HRESULT hr;
+	hr = F(s->dev, Activate, &IID_IAudioClient, CLSCTX_ALL, NULL,
+	       (void**)&s->silc);
+	CHKH(hr, "get silent audio client");
+	REFERENCE_TIME def, min;
+	hr = F(s->silc, GetDevicePeriod, &def, &min);
+	CHKH(hr, "get silent device period");
+	s->silto = (u32)(def / 1000);
+	WAVEFORMATEX *wf;
+	hr = F(s->silc, GetMixFormat, &wf);
+	bool sup = (wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+		    (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+		     IsEqualGUID(&((WAVEFORMATEXTENSIBLE*)wf)->SubFormat,
+				 &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)));
+	if (!sup)
+		DIE("unsupported mix format");
+	CHKH(hr, "get silent mix format");
+	hr = F(s->silc, Initialize, AUDCLNT_SHAREMODE_SHARED,
+	       AUDCLNT_STREAMFLAGS_EVENTCALLBACK, def, 0, wf, NULL);
+	CHKH(hr, "make silent audio client");
+	UINT32 bufsz;
+	hr = F(s->silc, GetBufferSize, &bufsz);
+	CHKH(hr, "get silent buffer size");
+	s->silbufsz = (u32)bufsz;
+	hr = F(s->silc, GetService, &IID_IAudioRenderClient,
+	       (void**)&s->silrc);
+	CHKH(hr, "make silent audio render client");
+	s->silevt = CreateEventW(NULL, FALSE, FALSE, NULL);
+	CHK(s->silevt, "make silent event");
+	hr = F(s->silc, SetEventHandle, s->silevt);
+	CHKH(hr, "set silent event handle");
+	CHKH(F(s->silc, Start), "start silent audio client");
+
+}
+
+static DWORD WINAPI silentproc(LPVOID p)
+{
+	S *s = p;
+	while (true) {
+		DWORD r = WaitForSingleObjectEx(s->silevt, s->silto, FALSE);
+		if (r == WAIT_FAILED)
+			continue;
+		u32 padding;
+		HRESULT hr = F(s->silc, GetCurrentPadding, &padding);
+		if (FAILED(hr))
+			continue;
+		u32 nframes = s->silbufsz - padding;
+		f32 *frames;
+		hr = F(s->silrc, GetBuffer, nframes, (BYTE**)&frames);
+		if (FAILED(hr))
+			continue;
+		F(s->silrc, ReleaseBuffer, nframes, AUDCLNT_BUFFERFLAGS_SILENT);
+	}
+	return 0;
+}
+
+static void runsilent(S *s)
+{
+	CreateThread(NULL, 0, silentproc, s, 0, NULL);
+}
+
 static bool iszero(u8 *b, u32 sz)
 {
 	enum {N = 8};
@@ -386,6 +450,9 @@ int main(int argc, char *argv[])
 	make(&s, inet_addr(argv[1]), (u16)strtol(argv[2], &end, 10));
 	if (!mute) {
 		makecapture(&s);
+		makesilent(&s);
+		/* prevent the device from sleeping by flushing silent audio */
+		runsilent(&s);
 		while (true)
 			record(&s);
 	} else {
