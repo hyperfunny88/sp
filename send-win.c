@@ -478,7 +478,8 @@ static void help(const char *argv)
 		"options:\n\t"
 		"-m\t(mute, only use as connector with sp-send-ll)\n\t"
 		"-b\tblacklist file for sp-send-ll (line separated, without "
-		".exe extension)";
+		".exe extension)\n\t"
+		"-R\t(automatically respawn process on death)";
 	INFO("usage: %s <ip> <port> [options...]\n%s", argv, s);
 }
 
