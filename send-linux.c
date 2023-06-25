@@ -93,7 +93,6 @@ static void makepw(S *s)
 		PW_KEY_FACTORY_NAME, "support.null-audio-sink",
 		PW_KEY_NODE_PASSIVE, "out",
 		PW_KEY_NODE_VIRTUAL, "true",
-		"audio.position", "FL,FR",
 		NULL);
 	s->stream = pw_stream_new(s->core, "sp-send", props);
 	CHK(s->stream, "make sink stream");
