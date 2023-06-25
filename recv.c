@@ -668,7 +668,7 @@ static Inst *pwinst(Pcfg pcfg, u32 devhash, bool listdev)
 						  "client-rt.conf", NULL), 0);
 	CHK(g->ctx, "make context");
 	g->core = pw_context_connect(g->ctx, NULL, 0);
-	CHK(g->ctx, "connect to pipewire");
+	CHK(g->core, "connect to pipewire");
 	int r = pw_core_add_listener(
 		g->core, &g->corelstn, &pwcoreevts, NULL);
 	CHK(r >= 0, "add core listener");
