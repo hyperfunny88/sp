@@ -708,8 +708,9 @@ static WAVEFORMATEXTENSIBLE makewavefmt(Cfg cfg)
 			.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
 			.nChannels = (WORD)cfg.channels,
 			.nSamplesPerSec = cfg.rate,
-			.nAvgBytesPerSec = cfg.rate * cfg.channels * 4,
-			.nBlockAlign = (WORD)cfg.channels * 4,
+			.nAvgBytesPerSec = (cfg.rate * cfg.channels *
+					    sizeof(f32)),
+			.nBlockAlign = (WORD)cfg.channels * sizeof(f32),
 			.wBitsPerSample = 32,
 			.cbSize = sizeof(wf)
 		},
