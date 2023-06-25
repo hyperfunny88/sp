@@ -5,16 +5,17 @@ use_pipewire=1
 flags="-Os -g -flto -Wall -Wextra -I . $CFLAGS"
 ldflags="-L /usr/local/lib $LDFLAGS"
 
-flags="$flags $ldflags"
-
+recvflags="$flags $ldflags"
 if [ $use_soundio = 1 ]; then
-	flags="$flags -DSP_SIO -lsoundio -lspeexdsp"
+	recvflags="$flags -DSP_SIO -lsoundio -lspeexdsp"
 fi
 if [ $use_pipewire = 1 ]; then
-	flags="$flags -DSP_PW $(pkg-config --cflags --libs libpipewire-0.3)"
+	recvflags="$flags -DSP_PW $(pkg-config --cflags --libs libpipewire-0.3)"
 fi
 
-echo $flags
+sendflags="$flags $ldflags $(pkg-config --cflags --libs libpipewire-0.3)"
 
-$CC $flags "$@" recv.c -o build/sp-recv &
+$CC $recvflags "$@" recv.c -o build/sp-recv &
+$CC $sendflags "$@" send-linux.c -o build/sp-send &
+
 wait $(jobs -p)

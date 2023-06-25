@@ -13,15 +13,16 @@ This is new software, so please file an issue if you encounter any problems
 - Low-latency
 - Provides stable audio
 - Provides 'accurate' audio
+- Supports both sending and receiving on Windows and Linux
 - Supports many backends (ALSA, PulseAudio, JACK (provided by libsoundio),
   native PipeWire, and WASAPI)
-- Simple (3 source files for each program and a header)
+- Simple (4 source files for each built program and a header)
 
 Contains 3 programs:
 - `sp-recv`: Receives audio and plays it. For Linux and Windows. Has ALSA,
   PulseAudio, JACK (provided by libsoundio), native PipeWire, and WASAPI
   backends.
-- `sp-send`: Captures audio and sends it to `sp-recv`. Windows-only (right now).
+- `sp-send`: Captures audio and sends it to `sp-recv`. For Linux and Windows.
 - `sp-send-ll`: An injected DLL that hooks the native WASAPI functions to yank
   the audio frames straight from the buffer of the hooked program before WASAPI
   gets it, therefore bypassing the whole Windows audio engine (mixer, resampler,
@@ -46,8 +47,17 @@ to).
 Start `sp-send <receiver ip> <port>` via a terminal on all of your machines or
 virtual machines that you want to send audio from.
 
-If you want to have low-latency audio and separated streams, run
-`install-ll.bat` as administrator **(after reading 'Caveats' below)**. To
+`sp-send` on Linux requires PipeWire. After you start it, you will need to need
+to change your default output device to `sp-send`. Also, PipeWire's default
+config for VMs has bad latency. Make sure you edit your `pipewire.conf` and
+`pipewire-pulse.conf` (if you don't already have them, copy them from
+/usr/share/pipewire/ to ~/.config/pipewire/ and edit that) and set
+`default.clock.min-quantum` in `vm.overrides` to something like 128 and
+`pulse.min.quantum` to 128/48000 in each respective file. If you get crackling,
+you can try increasing the 128 to something higher or revert it back to 1024.
+
+If you want to have low-latency audio and separated streams and are on Windows,
+run `install-ll.bat` as administrator **(after reading 'Caveats' below)**. To
 uninstall, run `uninstall-ll.bat` as administrator. `sp-send-ll` requires both
 `sp-recv` and `sp-send` (non-ll) to be running and connected to work.
 
@@ -63,6 +73,8 @@ latency with it).
 
 - A C11 compiler supporting a small subset of GNU extensions (TCC works)
 
+#### For sp-recv:
+
 For ALSA, PulseAudio, and Jack backends:
 - libsoundio
 - speexdsp
@@ -70,15 +82,19 @@ For ALSA, PulseAudio, and Jack backends:
 AND/OR for PipeWire backend:
 - PipeWire
 
+#### For sp-send:
+
+- PipeWire
+
 ### For cross-compiling to Windows:
 - MinGW
 - meson
 - CMake
 
-`sp-recv`:
+#### For sp-recv:
 - speexdsp
 
-`sp-send`:
+#### For sp-send:
 - MinHook
 
 `speexdsp` and `MinHook` are included as submodules for cross-compilation. For a
