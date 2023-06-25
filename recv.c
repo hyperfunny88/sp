@@ -660,7 +660,7 @@ static Inst *pwinst(Pcfg pcfg, u32 devhash, bool listdev)
 		.corelstn = {0}
 	};
         pw_init(NULL, NULL);
-	g->loop = pw_thread_loop_new("sp-recv-pipewire", NULL);
+	g->loop = pw_thread_loop_new("sp-recv-pw", NULL);
 	pw_thread_loop_lock(g->loop);
 	CHK(pw_thread_loop_start(g->loop) >= 0, "start thread loop");
 	g->ctx = pw_context_new(pw_thread_loop_get_loop(g->loop),
@@ -995,14 +995,14 @@ static Socket makesock(u16 port)
 	WSADATA ws;
 	CHK(WSAStartup(MAKEWORD(2, 2), &ws) == 0, "make winsock2");
 #endif
-	struct sockaddr_in sinv = {
+	struct sockaddr_in sa = {
 		.sin_family = AF_INET,
 		.sin_port = htons(port),
 		.sin_addr.s_addr = htonl(INADDR_ANY)
 	};
 	Socket sfd = socket(PF_INET, SOCK_DGRAM, 0);
 	CHK(sfd > 0, "make socket");
-        CHK(bind(sfd, (struct sockaddr*)&sinv, sizeof(sinv)) != -1, "bind");
+        CHK(bind(sfd, (struct sockaddr*)&sa, sizeof(sa)) != -1, "bind");
 	return sfd;
 }
 

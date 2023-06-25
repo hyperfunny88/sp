@@ -444,14 +444,14 @@ static void record(S *s)
 		} else
 			memcpy(b, frames, sz);
 		enchdr(buf, (Hdr){s->cfg, cmd});
-		struct sockaddr_in sin = {
+		struct sockaddr_in sa = {
 			.sin_family = AF_INET,
 			.sin_port = htons(s->port),
 			.sin_addr.s_addr = s->ip
 		};
 		u32 tosend = sz + s->namesz + 1 + HDR_SZ;
 		int sent = sendto(s->sfd, (const char*)buf, (int)tosend, 0,
-				  (struct sockaddr*)&sin, sizeof(sin));
+				  (struct sockaddr*)&sa, sizeof(sa));
 		if ((u32)sent < tosend)
 			WARN("sent (%i) < to send (%u)", (int)sent, tosend);
 		F(s->capt, ReleaseBuffer, read);
