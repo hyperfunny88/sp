@@ -64,7 +64,7 @@ struct S {
 	f32 vols[MAX_CHANNELS];
 	PlayState ps;
 	struct sockaddr sa;
-	bool fullymade, logged;
+	bool fullymade, logged, logunderrun;
 	Resample *rs;
 };
 
@@ -91,6 +91,8 @@ static u32 play(S *s, u32 nframes, u32 avgframes, void *out, bool fill)
 	    base = s->cfg.bufsz * fsz,
 	    slack = s->cfg.rate / 1000 * s->slack * fsz,
 	    thres = base + MAX(slack, 2 * avgneed);
+	if (readable >= need)
+		s->logunderrun = true;
 #ifdef SP_DEBUG
 	i32 thresms = (i32)toms(thres, s->cfg),
 	    lastthresms = (i32)toms(s->lastthres, s->cfg);
@@ -106,11 +108,11 @@ static u32 play(S *s, u32 nframes, u32 avgframes, void *out, bool fill)
 		     s->name, toms(readable, s->cfg),
 		     toms(readable - leave, s->cfg), toms(leave, s->cfg),
 		     toms(thres, s->cfg));
-	} else
+	} else if (readable >= s->cfg.bufsz)
 		read = ringbuf_read(&s->rb, buf, need);
 	pthread_mutex_unlock(&s->mtx);
 	if (read < need && fill) {
-		if (s->pauseheur < 2000)
+		if (s->pauseheur < 2000 && s->logunderrun)
 			WARN("[%s]: underrun (%u)", s->name, ++s->underrun);
 		else
 			s->ps = PLAY_TMP_PAUSE;
@@ -1274,7 +1276,7 @@ unlock:
 	if (s->rs)
 		pthread_cond_signal(&s->rs->cnd);
 	u64 t = ns();
-	if (!quiet && s->t && (0 || s->ctr % 100 == 0)) {
+	if (!quiet && s->t && s->ctr % 100 == 0) {
 		INFO("[%s]: recv (%u): %u bytes - %u us", s->name,
 		     s->ctr, read, (u32)(t - s->t) / 1000);
 	}
