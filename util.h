@@ -278,14 +278,19 @@ inline static void respawner(int argc, char *argv[], int startarg)
 			continue;
 		*argv[i] = '~';
 		INFO("respawning process on death");
+		u32 sleepms = 100;
 #ifdef __unix__
 		while (fork() > 0) {
 			wait(&(int){0});
+			struct timespec ts = {.tv_nsec = sleepms * 1000000};
+			nanosleep(&ts, NULL);
 			WARN("respawn");
 		}
 #elif defined(_WIN32)
-		while (_spawnv(_P_WAIT, argv[0], (const char**)argv) >= 0)
+		while (_spawnv(_P_WAIT, argv[0], (const char**)argv) >= 0) {
+			Sleep(sleepms);
 			WARN("respawn");
+		}
 #endif
 	}
 }
