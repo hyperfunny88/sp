@@ -108,18 +108,22 @@ difficult.
 For the Linux build you do not need a build system. You can just run `cc` on
 `recv.c` and link against the libraries above.
 
-For a quick build, there are some scripts included. Simply run `./build/unix &&
+For a quick build, there are some scripts included. Simply run `./build/linux &&
 ./build/win`. You will find the binaries located in build/.
+
+If you are using `./build/linux`, you can change the backends for `sp-recv` that
+are built by setting `USE_SOUNDIO` or `USE_PIPEWIRE` to 0 or 1. By default, only
+the PipeWire backend is built.
 
 # Caveats
 
 sp is targeted towards VM communication, and is not optimized to be used over a
 physical network. The way that sp sends data is likely unfriendly to most
 routers and network cards. As mentioned earlier, sp does not do any extra
-buffering, batching, or processing at the sender's side. Therefore
-if you are using `sp-send-ll`, every hooked program will create it's own
-	connection to send the stream. This means that with `sp-send-ll`, the
-	more clients you have, the more bandwidth it uses.
+buffering, batching, or processing at the sender's side. Therefore if you are
+using `sp-send-ll`, every hooked program will create it's own connection to send
+the stream. This means that with `sp-send-ll`, the more clients you have, the
+more bandwidth it uses.
 
 `sp-send-ll` will not work with some protected programs (ex. web browser). It
 will also not work with audio capture programs (like OBS) as it mutes the stream
