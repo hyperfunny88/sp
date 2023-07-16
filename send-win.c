@@ -18,6 +18,7 @@ typedef struct {
 	u32 blacklist[MAX_BLACKLIST];
 	u32 ip, evtto, namesz, silbufsz, silto;
 	u16 port;
+	bool started;
 } S;
 
 static IMMDevice *defdev(S *s)
@@ -100,7 +101,7 @@ static void makeclient(S *s)
 	     cfg.bufsz / framesz(cfg), cfg.bufsz * 1000 / cfg.rate);
 }
 
-static void makecapt(S *s)
+static void makecaptclient(S *s)
 {
 	HRESULT hr;
 	hr = F(s->client, GetService, &IID_IAudioCaptureClient,
@@ -118,6 +119,8 @@ static void makesock(S *s)
 	CHK(WSAStartup(MAKEWORD(2, 2), &ws) == 0, "make winsock2");
 	s->sfd = socket(AF_INET, SOCK_DGRAM, 0);
 	CHK(s->sfd > 0, "make socket");
+	int sz = BUF_SZ;
+	setsockopt(s->sfd, SOL_SOCKET, SO_SNDBUF, (char*)&sz, sizeof(sz));
 }
 
 static HANDLE makepipe(void)
@@ -307,7 +310,8 @@ static void make(S *s, u32 ip, u16 port, const char *blacklist)
 		.ip = ip,
 		.port = port,
 		.name = {0},
-		.namesz = 0
+		.namesz = 0,
+		.started = false
 	};
 	timeBeginPeriod(1);
 	makesock(s);
@@ -320,7 +324,7 @@ static void make(S *s, u32 ip, u16 port, const char *blacklist)
 	CreateThread(NULL, 0, pipeproc, s, 0, NULL);
 }
 
-static void makecapture(S *s)
+static void makecapt(S *s)
 {
 	HRESULT hr;
 	hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -331,9 +335,10 @@ static void makecapture(S *s)
 	CHK(s->dev = defdev(s), "get default device");
 	logdev(s->dev);
 	makeclient(s);
-	makecapt(s);
+	makecaptclient(s);
 	CHKH(F(s->client, Start), "start audio client");
-	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+	BOOL b = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+	CHK(b, "set process priority");
 }
 
 static void makesilent(S *s)
@@ -385,8 +390,8 @@ static DWORD WINAPI silentproc(LPVOID p)
 		if (FAILED(hr))
 			continue;
 		u32 nframes = s->silbufsz - padding;
-		f32 *frames;
-		hr = F(s->silrc, GetBuffer, nframes, (BYTE**)&frames);
+		u8 *frames;
+		hr = F(s->silrc, GetBuffer, nframes, &frames);
 		if (FAILED(hr))
 			continue;
 		F(s->silrc, ReleaseBuffer, nframes, AUDCLNT_BUFFERFLAGS_SILENT);
@@ -435,7 +440,19 @@ static void record(S *s)
 		u8 buf[BUF_SZ], *b = buf + HDR_SZ;
 		memcpy(b, s->name, s->namesz + 1);
 		b += s->namesz + 1;
-		u32 sz = read * framesz(s->cfg);
+		u32 sz = read * framesz(s->cfg),
+		    tosend = HDR_SZ + s->namesz + 1;
+		struct sockaddr_in sa = {
+			.sin_family = AF_INET,
+			.sin_port = htons(s->port),
+			.sin_addr.s_addr = s->ip
+		};
+		if (!s->started) {
+			s->started = true;
+			enchdr(buf, (Hdr){s->cfg, CMD_START});
+			sendto(s->sfd, (const char*)buf, (int)tosend, 0,
+			       (struct sockaddr*)&sa, sizeof(sa));
+		}
 		u8 cmd = CMD_NONE;
 		if (flags & AUDCLNT_BUFFERFLAGS_SILENT || iszero(frames, sz)) {
 			memcpy(b, &sz, sizeof(sz));
@@ -444,12 +461,7 @@ static void record(S *s)
 		} else
 			memcpy(b, frames, sz);
 		enchdr(buf, (Hdr){s->cfg, cmd});
-		struct sockaddr_in sa = {
-			.sin_family = AF_INET,
-			.sin_port = htons(s->port),
-			.sin_addr.s_addr = s->ip
-		};
-		u32 tosend = sz + s->namesz + 1 + HDR_SZ;
+		tosend += sz;
 		int sent = sendto(s->sfd, (const char*)buf, (int)tosend, 0,
 				  (struct sockaddr*)&sa, sizeof(sa));
 		if ((u32)sent < tosend)
@@ -514,7 +526,7 @@ int main(int argc, char *argv[])
 	make(&s, inet_addr(argv[1]), (u16)strtol(argv[2], &end, 10),
 	     blacklist);
 	if (!mute) {
-		makecapture(&s);
+		makecapt(&s);
 		makesilent(&s);
 		/* prevent the device from sleeping by flushing silent audio */
 		runsilent(&s);
