@@ -528,7 +528,7 @@ static void pwmake(Inst *inst, S *s)
 			.rate = s->cfg.rate
 		));;
 	pw_thread_loop_lock(g->loop);
-	p->stream = pw_stream_new(g->core, "audio-src", props);
+	p->stream = pw_stream_new(g->core, s->name, props);
 	CHK(p->stream, "[%s]: make stream", s->name);
 	pw_stream_add_listener(p->stream, &p->streamlstn, &streamevts, p);
 	CHK(pw_stream_connect(
