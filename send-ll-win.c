@@ -615,33 +615,40 @@ static DWORD WINAPI dllmain(void *p)
 	loadevt = CreateEventW(NULL, TRUE, FALSE, NULL);
 	/* doing all of this thread stuff because we need to hook Initialize
 	 * fast before the program calls it */
-	HANDLE th = CreateThread(NULL, 0, loadpcfg, NULL, 0, NULL);
 	getprgname();
+	HANDLE th = CreateThread(NULL, 0, loadpcfg, NULL, 0, NULL);
 	CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#	define BLCHK(to)  \
+		if (WaitForSingleObject(loadevt, 0) == WAIT_OBJECT_0 && \
+		    loadstate != LOAD_OK) { \
+			WaitForSingleObject(th, INFINITE); \
+			goto to; \
+		}
 	MH_Initialize();
+	BLCHK(endmh);
 	HRESULT hr;
 	IMMDeviceEnumerator *devenum;
 	hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
 			      &IID_IMMDeviceEnumerator, (void**)&devenum);
 	TRYH(hr, end);
+	BLCHK(end);
 	IMMDevice *dev;
 	hr = F(devenum, GetDefaultAudioEndpoint, eRender, eConsole, &dev);
 	TRYH(hr, edev);
+	BLCHK(edev);
 	IAudioClient *c;
 	hr = F(dev, Activate, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&c);
 	TRYH(hr, eclient);
+	BLCHK(eclient);
 	MH_STATUS mh = MH_OK;
 	HOOKCOM(c, Initialize);
 	TRY(mh == MH_OK, ecreatehook);
+	BLCHK(ecreatehook);
 	mh = MH_EnableHook(c->lpVtbl->Initialize);
 	TRY(mh == MH_OK, eenablehook);
+	BLCHK(eenablehook);
 	WaitForSingleObject(th, INFINITE);
-	if (loadstate != LOAD_OK) {
-		HANDLE evt = loadevt;
-		loadevt = NULL;
-		CloseHandle(evt);
-	} else
-		ok = true;
+	ok = loadstate == LOAD_OK;
 eenablehook:
 	if (!ok)
 		MH_RemoveHook(&c->lpVtbl->Initialize);
@@ -653,8 +660,11 @@ edev:
 	F(devenum, Release);
 end:
 	if (!ok) {
-		MH_Uninitialize();
 		CoUninitialize();
+	endmh:
+		MH_Uninitialize();
+		CloseHandle(loadevt);
+		loadevt = NULL;
 		FreeLibraryAndExitThread((HMODULE)inst, 0);
 	}
 	return 0;
