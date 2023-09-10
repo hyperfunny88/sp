@@ -101,10 +101,8 @@ static HRESULT HOOKCALL h_GetBuffer(IAudioRenderClient *rc,
 {
 	HRESULT r = o_GetBuffer(rc, NumFramesRequested, ppData);
 	V *v = vfromrc(rc);
-	if (!v)
-		goto ret;
-	v->buf = *ppData;
-ret:
+	if (v)
+		v->buf = *ppData;
 	return r;
 }
 
@@ -322,7 +320,7 @@ static HRESULT HOOKCALL h_SetAllVolumes(
 static void makesock(void)
 {
 	WSADATA ws;
-	CHK(WSAStartup(MAKEWORD(2, 2), &ws) == 0, "init winsock2");
+	WSAStartup(MAKEWORD(2, 2), &ws); /* assume it succeeds, TODO: handle */
 	s->sfd = socket(AF_INET, SOCK_DGRAM, 0);
 	char hostname[MAX_NAME];
 	*hostname = '\0';

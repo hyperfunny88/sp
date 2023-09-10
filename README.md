@@ -161,7 +161,6 @@ to grab the audio stream).
 # Todo
 
 - Make the thing user friendly(-er)
-- Linux audio capture/client
 - Optimize the header data
 
 It was very simple at one point but now it's a less simple. Might tidy it up one

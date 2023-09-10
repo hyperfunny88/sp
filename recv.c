@@ -460,11 +460,14 @@ static void pwcvt(S *s, f32 **outs, u8 *in, u32 bsz, Cfg cfg)
 			f32 raw = load(b) * s->vols[i],
 			    clamped = fmaxf(fminf(raw, 1.0f), -1.0f);
 			hasclipped |= raw != clamped;
-			*outs[i] = clamped;
+			// *outs[i] = clamped;
+			*outs[i] = raw;
 		}
 	}
 	if (hasclipped)
 		WARN("[%s]: clipping (%u)", s->name, ++s->clipped);
+	if (hasclipped)
+		DEBUG("[%s]: writing raw", s->name);
 }
 
 static void pwproc(void *userdata)
